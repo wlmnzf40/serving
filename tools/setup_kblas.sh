@@ -2,30 +2,61 @@
 # setup_kblas.sh — 一键完成 KML KBLAS 编译前的所有准备工作
 #
 # 用法：
-#   bash tools/setup_kblas.sh [BAZEL_BIN] [KML_ROOT]
+#   bash tools/setup_kblas.sh [BAZEL_BIN] [KML_LIB_DIR]
 #
-# 参数（均有默认值）：
-#   BAZEL_BIN  bazel 可执行路径      默认 /home/wanglimin/bazel-7.4.1
-#   KML_ROOT   KML 安装根目录        默认 /usr/local/kml
+# 参数（均有默认值，脚本会自动探测）：
+#   BAZEL_BIN    bazel 可执行路径
+#                默认 /home/wanglimin/bazel-7.4.1
+#   KML_LIB_DIR  包含 libkblas.so 的目录（只需 lib 目录，不是根目录）
+#                自动探测顺序：
+#                  1. <repo>/third_party/kml/lib/kblas/omp/  （vendored，OMP 版）
+#                  2. <repo>/third_party/kml/lib/kblas/      （vendored，非 OMP）
+#                  3. <repo>/third_party/kml/lib/            （vendored，扁平结构）
+#                  4. /usr/local/kml/lib/                    （系统安装）
+#                  5. 手动指定的路径
 #
 # 完成以下工作（每一步均幂等，重复运行安全）：
-#   1. 检查 tensorflow_serving/repo.bzl 是否有 tf_serving_vendored，
-#      没有则自动追加
-#   2. 检查并修改 .bazelrc 里 kml_kblas config 的路径（如果 KML 不在默认位置）
-#   3. patch eigen_contraction_kernel.h（dnnl_sgemm → cblas_sgemm）
+#   1. 检查 tensorflow_serving/repo.bzl 是否有 tf_serving_vendored，没有则自动追加
+#   2. 在 .bazelrc kml_kblas config 里写入实际 KML lib 路径（-L 和 -rpath）
+#   3. patch eigen_contraction_kernel.h（dnnl_sgemm → cblas_sgemm 内联前向声明）
+#   4. 打印验证命令和完整编译命令
 
 set -euo pipefail
-
-BAZEL="${1:-/home/wanglimin/bazel-7.4.1}"
-KML_ROOT="${2:-/usr/local/kml}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+BAZEL="${1:-/home/wanglimin/bazel-7.4.1}"
+
+# ── KML lib 目录自动探测 ───────────────────────────────────────────────────────
+_detect_kml_lib() {
+    local candidates=(
+        "$REPO_ROOT/third_party/kml/lib/kblas/omp"   # vendored OMP（优先）
+        "$REPO_ROOT/third_party/kml/lib/kblas"        # vendored 非 OMP
+        "$REPO_ROOT/third_party/kml/lib"              # vendored 扁平
+        "/usr/local/kml/lib"                           # 系统安装
+    )
+    for d in "${candidates[@]}"; do
+        if [[ -f "$d/libkblas.so" ]]; then
+            echo "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [[ $# -ge 2 ]]; then
+    KML_LIB_DIR="$2"
+elif _detected=$(_detect_kml_lib 2>/dev/null); then
+    KML_LIB_DIR="$_detected"
+else
+    KML_LIB_DIR="/usr/local/kml/lib"   # fallback，可能不存在
+fi
+
 echo "=== KML KBLAS Setup ==="
-echo "  Bazel   : $BAZEL"
-echo "  KML_ROOT: $KML_ROOT"
-echo "  Repo    : $REPO_ROOT"
+echo "  Bazel      : $BAZEL"
+echo "  KML lib dir: $KML_LIB_DIR"
+echo "  Repo       : $REPO_ROOT"
 echo ""
 
 # ── Step 1: repo.bzl ─────────────────────────────────────────────────────────
@@ -52,32 +83,35 @@ BZL_EOF
     echo "[1/3] repo.bzl: appended tf_serving_vendored. Done"
 fi
 
-# ── Step 2: .bazelrc KML 路径 ─────────────────────────────────────────────────
+# ── Step 2: .bazelrc KML 路径（写入实际绝对路径）────────────────────────────────
 
 BAZELRC="$REPO_ROOT/.bazelrc"
-DEFAULT_KML="/usr/local/kml"
 
-if [[ "$KML_ROOT" != "$DEFAULT_KML" ]]; then
-    # 检查 .bazelrc 里是否还是默认路径
-    if grep -q "$DEFAULT_KML" "$BAZELRC"; then
-        echo "[2/3] .bazelrc: updating KML path $DEFAULT_KML → $KML_ROOT"
-            sed -i "s|$DEFAULT_KML/lib|$KML_ROOT/lib|g"         "$BAZELRC"
-        echo "[2/3] .bazelrc: updated. Done"
-    else
-        echo "[2/3] .bazelrc: KML path already customized. OK"
-    fi
-else
-    echo "[2/3] .bazelrc: using default KML path $DEFAULT_KML. OK"
-fi
-
-# 验证 libkblas.so 存在（只警告，不中止）
-# 注意：不再需要 kblas.h——patch 脚本直接内联了 cblas_sgemm 前向声明，无需 -I 标志
-if [[ ! -f "$KML_ROOT/lib/libkblas.so" ]]; then
-    echo "  WARNING: $KML_ROOT/lib/libkblas.so not found."
-    echo "  请先安装 KML（libkblas.so 用于链接期，kblas.h 不再需要）："
+# 验证 libkblas.so
+if [[ ! -f "$KML_LIB_DIR/libkblas.so" ]]; then
+    echo "WARNING: $KML_LIB_DIR/libkblas.so not found."
+    echo "  请先安装或 vendor KML："
     echo "    wget -O /tmp/boostkit-kml-1.7.0-1.aarch64.rpm \\"
     echo "      https://repo.oepkgs.net/openeuler/rpm/openEuler-20.03-LTS-SP3/extras/aarch64/Packages/b/boostkit-kml-1.7.0-1.aarch64.rpm"
-    echo "    sudo rpm -ivh /tmp/boostkit-kml-1.7.0-1.aarch64.rpm"
+    echo "    # 有 sudo: sudo rpm -ivh /tmp/boostkit-kml-1.7.0-1.aarch64.rpm"
+    echo "    # 无 root: rpm2cpio /tmp/boostkit-kml-*.rpm | cpio -idmv --no-absolute-filenames -D \$REPO_ROOT/third_party/kml"
+    echo ""
+fi
+
+# 替换 .bazelrc 里 kml_kblas 的 -L 和 -rpath 为实际路径
+# 匹配模式：-L<任意路径>  →  -L<KML_LIB_DIR>
+if grep -q 'build:kml_kblas.*linkopt.*-L' "$BAZELRC"; then
+    CURRENT_L=$(grep 'build:kml_kblas.*linkopt.*-L' "$BAZELRC" | head -1 | sed 's/.*-L//' | tr -d '\n')
+    if [[ "$CURRENT_L" == "$KML_LIB_DIR" ]]; then
+        echo "[2/3] .bazelrc: kml_kblas linker path already correct. OK"
+    else
+        echo "[2/3] .bazelrc: updating linker path → $KML_LIB_DIR"
+        sed -i "s|build:kml_kblas --linkopt=-L.*|build:kml_kblas --linkopt=-L$KML_LIB_DIR|" "$BAZELRC"
+        sed -i "s|build:kml_kblas --linkopt=-Wl,-rpath,.*|build:kml_kblas --linkopt=-Wl,-rpath,$KML_LIB_DIR|" "$BAZELRC"
+        echo "[2/3] .bazelrc: updated. Done"
+    fi
+else
+    echo "[2/3] .bazelrc: kml_kblas linkopt not found (unexpected). Please check .bazelrc manually."
 fi
 
 # ── Step 3: patch eigen_contraction_kernel.h ──────────────────────────────────
@@ -88,6 +122,7 @@ if [[ ! -x "$BAZEL" ]]; then
     echo "    bash $SCRIPT_DIR/apply_kblas_patch.sh $BAZEL"
     echo ""
     echo "=== Setup complete (patch skipped) ==="
+    _print_summary
     exit 0
 fi
 
@@ -98,10 +133,9 @@ if [[ -n "$OUTPUT_BASE" ]]; then
 fi
 
 if [[ -z "$OUTPUT_BASE" ]] || [[ ! -f "$HEADER" ]]; then
-    echo "[3/3] eigen_contraction_kernel.h: not in Bazel cache yet."
-    echo "  先不加 --config=kml_kblas 跑一次普通 build，让 Bazel 解压 TF，"
-    echo "  然后再执行："
-    echo "    bash $SCRIPT_DIR/setup_kblas.sh $BAZEL $KML_ROOT"
+    echo "[3/3] eigen_contraction_kernel.h: Bazel cache 里还没有这个文件。"
+    echo "  先不加 --config=kml_kblas 跑一次普通 build 让 Bazel 解压 TF，"
+    echo "  然后重新执行本脚本。"
     echo ""
     echo "=== Setup complete (patch deferred) ==="
     exit 0
@@ -114,18 +148,36 @@ else
     bash "$SCRIPT_DIR/apply_kblas_patch.sh" "$BAZEL"
 fi
 
+# ── 打印汇总 ──────────────────────────────────────────────────────────────────
+
+BAZEL_DISTDIR="${BAZEL_DISTDIR:-/home/wanglimin/tf_new/dist}"
+GCC_RPATH="${GCC_RPATH:-/home/wanglimin/gcc-12.3.1-2025.12-aarch64-linux/lib64}"
+
 echo ""
 echo "=== Setup complete ==="
 echo ""
-echo "Build command:"
-echo "  $BAZEL build -c opt --config=kml_kblas \\"
-echo "    --distdir=/home/wanglimin/tf_new/dist \\"
+echo "验证 KBLAS 已链入（build 完成后）："
+echo "  nm -D bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep cblas_sgemm"
+echo "  # 预期：U cblas_sgemm"
+echo "  ldd bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep kblas"
+echo "  # 预期：libkblas.so => $KML_LIB_DIR/libkblas.so"
+echo ""
+echo "编译命令："
+echo "  $BAZEL build -c opt \\"
+echo "    --distdir=$BAZEL_DISTDIR \\"
 echo "    --define=no_cuda_support=true --define=no_nccl_support=true \\"
 echo "    --define=no_kafka_support=true --define=no_google_cloud_support=true \\"
 echo "    --repo_env=CC=/usr/bin/gcc --repo_env=CXX=/usr/bin/g++ \\"
 echo "    --host_linkopt=-Wl,--disable-new-dtags \\"
-echo "    --host_linkopt=-Wl,-rpath,/home/wanglimin/gcc-12.3.1-2025.12-aarch64-linux/lib64 \\"
+echo "    --host_linkopt=-Wl,-rpath,$GCC_RPATH \\"
 echo "    --linkopt=-Wl,--disable-new-dtags \\"
-echo "    --linkopt=-Wl,-rpath,/home/wanglimin/gcc-12.3.1-2025.12-aarch64-linux/lib64 \\"
+echo "    --linkopt=-Wl,-rpath,$GCC_RPATH \\"
+echo "    --config=kml_kblas \\"
 echo "    //tf_serving_gemm/tf_gemm_server:gemm_server \\"
 echo "    //tf_serving_gemm/tf_gemm_server:gemm_client"
+echo ""
+echo "运行（必须设 LD_LIBRARY_PATH，因为 $KML_LIB_DIR 在非标准位置）："
+echo "  export LD_LIBRARY_PATH=$KML_LIB_DIR:\$LD_LIBRARY_PATH"
+echo "  ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server &"
+echo "  sleep 3 && cat server.log   # 确认启动日志"
+echo "  ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client --iters=30 --warmup=5"
