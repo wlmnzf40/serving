@@ -1,0 +1,49 @@
+syntax = "proto3";
+package gemm;
+
+service GEMMService {
+  // Single call: client sends A, B; server computes C = A*B and returns it
+  // along with the pure server-side compute time.
+  rpc Compute (ComputeRequest) returns (ComputeResponse);
+
+  // Sweep: client asks the server to benchmark a list of square sizes.
+  // Measurement happens entirely on the server (no network in the loop).
+  rpc Sweep (SweepRequest) returns (SweepResponse);
+}
+
+// ── Compute ──────────────────────────────────────────────────────────────────
+
+message ComputeRequest {
+  repeated float a_data = 1;   // row-major flattened, shape [M, K]
+  repeated float b_data = 2;   // row-major flattened, shape [K, N]
+  int32 M = 3;
+  int32 K = 4;
+  int32 N = 5;
+}
+
+message ComputeResponse {
+  repeated float c_data = 1;   // row-major flattened, shape [M, N]
+  double server_compute_ms = 2;
+}
+
+// ── Sweep ─────────────────────────────────────────────────────────────────────
+
+message SweepRequest {
+  repeated int32 sizes = 1;   // square sizes, e.g. [128, 256, 512, 1024, 2048]
+  int32 iters  = 2;           // benchmark iterations per size (default 50)
+  int32 warmup = 3;           // warmup iterations (default 10)
+}
+
+message SweepResult {
+  int32  M       = 1;
+  int32  K       = 2;
+  int32  N       = 3;
+  double avg_ms  = 4;
+  double p50_ms  = 5;
+  double p99_ms  = 6;
+  double gflops  = 7;
+}
+
+message SweepResponse {
+  repeated SweepResult results = 1;
+}
