@@ -51,6 +51,30 @@ build:mkl_aarch64 --define=build_with_openmp=true
 build:mkl_aarch64 --copt=-march=armv8.2-a
 build:mkl_aarch64 --copt=-O3
 
+# KML KBLAS contraction kernel for Kunpeng/aarch64.
+# Replaces Eigen's default GEBP and TF's oneDNN contraction kernel with
+# KML's cblas_sgemm, covering the ParallelMatMulKernel (tensor.contract)
+# path that handles ~95% of MatMul FLOPs in production models.
+#
+# Prerequisites:
+#   KML installed at /usr/local/kml  (override KML_ROOT env if different)
+#   kblas.h  -> /usr/local/kml/include/kblas.h
+#   libkblas -> /usr/local/kml/lib/libkblas.so
+#
+# Usage:
+#   bazel build --config=kml_kblas \
+#     //tensorflow_serving/model_servers:tensorflow_model_server
+build:kml_kblas --copt=-DTENSORFLOW_USE_CUSTOM_CONTRACTION_KERNEL
+build:kml_kblas --copt=-DTENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
+build:kml_kblas --copt=-I/usr/local/kml/include
+build:kml_kblas --linkopt=-L/usr/local/kml/lib
+build:kml_kblas --linkopt=-lkblas
+build:kml_kblas --linkopt=-Wl,-rpath,/usr/local/kml/lib
+build:kml_kblas --copt=-fopenmp
+build:kml_kblas --linkopt=-fopenmp
+build:kml_kblas --copt=-O3
+build:kml_kblas --copt=-march=armv8.2-a
+
 build --define=build_with_onednn_v2=true
 build --define=xnn_enable_avxvnni=false
 build --define=xnn_enable_avxvnniint8=false

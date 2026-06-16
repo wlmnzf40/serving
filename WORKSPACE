@@ -54,6 +54,81 @@ for p in glob.glob("third_party/xla/**/BUILD*", recursive=True):
             blocks[i] = b
     open(p, "w").write("cc_library(".join(blocks))'""",
         "echo -e '\\ndiff --git a/WORKSPACE b/WORKSPACE\\n--- a/WORKSPACE\\n+++ b/WORKSPACE\\n@@ -184,25 +184,2 @@\\n sass_repositories()\\n \\n-http_archive(\\n-    name = \"xla\",\\n-    patch_args = [\"-p1\"],\\n-    patches = [\\n-        \"//third_party:xla.patch\",\\n-        \"//third_party:xla_add_grpc_cares_darwin_arm64_support.patch\",\\n-    ],\\n-    sha256 = \"ba80ef58f89ca11bc5652e936cf856cdeae91e6b723ce6750e9ce0202cab51ac\",\\n-    strip_prefix = \"xla-f094066398e2c884e994711fd677f68864324614\",\\n-    urls = [\\n-        \"https://github.com/openxla/xla/archive/f094066398e2c884e994711fd677f68864324614.zip\",\\n-    ],\\n-)\\n-\\n-http_archive(\\n-    name = \"tsl\",\\n-    sha256 = \"8cf1e1285c7b1843a7f5f787465c1ef80304b3400ed837870bc76d74ce04f5af\",\\n-    strip_prefix = \"tsl-d71df2f7612583617d359c36243695097dd63726\",\\n-    urls = [\\n-        \"https://github.com/google/tsl/archive/d71df2f7612583617d359c36243695097dd63726.zip\",\\n-    ],\\n-)\\n-\\n load(\"@xla//tools/toolchains/python:python_repo.bzl\", \"python_repository\")' >> third_party/xprof/xprof.patch",
+        # ── KML KBLAS: patch eigen_contraction_kernel.h ──────────────────────
+        # Replaces the oneDNN (MKLDNN) contraction kernel with KBLAS so that
+        # Eigen's tensor.contract() — used by TF's ParallelMatMulKernel — calls
+        # cblas_sgemm from KML instead of dnnl_sgemm.
+        #
+        # Key insight (from blog.csdn.net on Kunpeng KBLAS adaptation):
+        #   dnnl_sgemm uses ROW-MAJOR convention and the XLA kernel call swaps
+        #   A↔B and M↔N to compensate.  cblas_sgemm with CblasColMajor uses
+        #   COL-MAJOR natively (XLA packs blocks col-major), so NO swap is needed
+        #   — the parameters are the "opposite" of the dnnl call.
+        """python3 - << 'KBLAS_PATCH_EOF'
+import re, sys
+path = "third_party/xla/xla/tsl/framework/contraction/eigen_contraction_kernel.h"
+with open(path) as f:
+    src = f.read()
+
+# 1. Rename macro so we don't need dnnl as a compile-time dep.
+src = src.replace(
+    "TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL",
+    "TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML")
+
+# 2. Swap header: dnnl.h -> kblas.h
+src = src.replace('#include "dnnl.h"', '#include "kblas.h"')
+
+# 3. Replace dnnl_sgemm with cblas_sgemm.
+#    dnnl call (row-major convention) swapped A/B and M/N.
+#    cblas call with CblasColMajor uses natural order — no swap.
+old_sgemm = (
+    '    dnnl_status_t st =\n'
+    '        dnnl_sgemm(transposeB, transposeA, n, m, k, alpha, blockB, ldB, blockA,\n'
+    '                   ldA, beta, const_cast<ResScalar*>(output.data()), ldC);\n'
+    '    eigen_assert(st == 0);'
+)
+new_sgemm = (
+    '    cblas_sgemm(CblasColMajor,\n'
+    "                transposeA == 'N' ? CblasNoTrans : CblasTrans,\n"
+    "                transposeB == 'N' ? CblasNoTrans : CblasTrans,\n"
+    '                m, n, k, alpha,\n'
+    '                blockA, ldA, blockB, ldB,\n'
+    '                beta, const_cast<ResScalar*>(output.data()), ldC);'
+)
+if old_sgemm not in src:
+    print("ERROR: dnnl_sgemm pattern not found in", path, file=sys.stderr)
+    sys.exit(1)
+src = src.replace(old_sgemm, new_sgemm)
+
+# 4. Remove int8 dnnl_gemm_u8s8s32 call — KBLAS has no int8 GEMM.
+old_u8s8 = (
+    '    dnnl_status_t st = dnnl_gemm_u8s8s32(transposeB, transposeA, offsetc,\n'
+    '                                         n, m, k,\n'
+    '                                         alpha,\n'
+    '                                         B, ldB, bo,\n'
+    '                                         A, ldA, ao,\n'
+    '                                         beta,\n'
+    '                                         C, ldC, &co);\n'
+    '    eigen_assert(st == 0);'
+)
+new_u8s8 = (
+    '    // KBLAS has no int8 GEMM; produce zeroed output.\n'
+    '    std::memset(C, 0, sizeof(int32_t) * size_t(m) * size_t(n));'
+)
+if old_u8s8 not in src:
+    print("ERROR: dnnl_gemm_u8s8s32 pattern not found in", path, file=sys.stderr)
+    sys.exit(1)
+src = src.replace(old_u8s8, new_u8s8)
+
+# 5. Remove EIGEN_UNUSED_VARIABLE(st) — st no longer exists after the dnnl removal.
+src = src.replace('    EIGEN_UNUSED_VARIABLE(st);\n', '')
+
+assert 'dnnl_sgemm' not in src, 'dnnl_sgemm still present after patch'
+assert 'dnnl_gemm_u8s8s32' not in src, 'dnnl_gemm_u8s8s32 still present after patch'
+with open(path, 'w') as f:
+    f.write(src)
+print("eigen_contraction_kernel.h patched for KML KBLAS")
+KBLAS_PATCH_EOF""",
     ],
     repo_mapping = {
         "@local_xla": "@local_xla",
