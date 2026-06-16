@@ -6,10 +6,11 @@ description: 鲲鹏 aarch64 上用华为 KML 替换 Eigen 矩阵乘内核，编�
 
 在鲲鹏（aarch64/Kunpeng）机器上完成以下三件事：
 1. 下载安装华为 KML（鲲鹏数学库）
-2. 确认仓库已预置 WORKSPACE patch 和 .bazelrc config
+2. 运行 `tools/apply_kblas_patch.sh` 直接 patch Bazel 缓存里的 eigen_contraction_kernel.h
 3. 编译 gemm_server / gemm_client 并验证 KBLAS 替换生效
 
-**重要约束**：TF 已编译过，不要执行 `bazel clean --expunge`，增量编译即可。
+**重要约束**：TF 已编译过，不要 `bazel clean --expunge`。
+本方案不修改 WORKSPACE（避免 Bazel 重新 fetch TF），改为独立脚本就地 patch 缓存文件。
 
 ---
 
@@ -24,62 +25,60 @@ wget -O /tmp/boostkit-kml-1.7.0-1.aarch64.rpm \
 sudo rpm -ivh /tmp/boostkit-kml-1.7.0-1.aarch64.rpm
 
 # 方式 B：无 root，解压到用户目录
-mkdir -p $HOME/kml
-rpm2cpio /tmp/boostkit-kml-1.7.0-1.aarch64.rpm | cpio -idmv --no-absolute-filenames -D $HOME/kml
-# 解压后找到实际子目录，例如 $HOME/kml/usr/local/kml/
+mkdir -p /home/wanglimin/kml
+rpm2cpio /tmp/boostkit-kml-1.7.0-1.aarch64.rpm | cpio -idmv --no-absolute-filenames -D /home/wanglimin/kml
+# 找到实际子目录，例如 /home/wanglimin/kml/usr/local/kml/
 ```
 
 **验证：**
 ```bash
-KML_ROOT=/usr/local/kml          # 方式 B 改为 $HOME/kml/usr/local/kml
+KML_ROOT=/usr/local/kml          # 方式 B 改为实际路径
 ls $KML_ROOT/include/kblas.h     # 必须存在
 ls $KML_ROOT/lib/libkblas.so     # 必须存在
 nm -D $KML_ROOT/lib/libkblas.so | grep cblas_sgemm   # 必须有输出
 ```
 
----
-
-## Step 2 — 确认仓库 patch 已就位（只读，不需修改）
-
-### 2-A 检查 WORKSPACE patch
-
+**如果 KML 装在非默认路径**，修改 `.bazelrc`：
 ```bash
-grep -c "KBLAS_PATCH_EOF" WORKSPACE   # 应输出 2（开头+结尾各一次）
-```
-
-WORKSPACE 里的 `patch_cmds` Python 脚本在 Bazel 首次解压 TF 源码时自动执行，将
-`third_party/xla/xla/tsl/framework/contraction/eigen_contraction_kernel.h` 里的
-`dnnl_sgemm(transposeB, transposeA, n, m, k, ...)` 替换为
-`cblas_sgemm(CblasColMajor, transposeA, transposeB, m, n, k, ...)`。
-
-### 2-B 检查 .bazelrc config
-
-```bash
-grep -A 12 "^build:kml_kblas" .bazelrc
-```
-
-预期关键行：
-```
-build:kml_kblas --copt=-DTENSORFLOW_USE_CUSTOM_CONTRACTION_KERNEL
-build:kml_kblas --copt=-DTENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
-build:kml_kblas --copt=-I/usr/local/kml/include
-build:kml_kblas --linkopt=-L/usr/local/kml/lib
-build:kml_kblas --linkopt=-lkblas
-build:kml_kblas --linkopt=-Wl,-rpath,/usr/local/kml/lib
-```
-
-**如果 KML 装在非默认路径**，执行（把 `/home/wanglimin/kml` 改成实际路径）：
-```bash
-KML_ACTUAL=$HOME/kml/usr/local/kml
+KML_ACTUAL=/home/wanglimin/kml/usr/local/kml   # 改成实际路径
 sed -i "s|/usr/local/kml/include|$KML_ACTUAL/include|g" .bazelrc
 sed -i "s|/usr/local/kml/lib|$KML_ACTUAL/lib|g"         .bazelrc
 ```
 
 ---
 
-## Step 3 — 编译命令
+## Step 2 — 运行 KBLAS patch 脚本
 
-> 把下面的路径变量替换成你机器上的实际值：
+脚本直接修改 Bazel output base 里已解压的 `eigen_contraction_kernel.h`，
+**不碰 WORKSPACE，Bazel 指纹不变，之前的编译缓存全部保留**。
+
+```bash
+BAZEL=/home/wanglimin/bazel-7.4.1   # 改成实际路径
+REPO=/home/wanglimin/tf_serving      # 改成仓库根目录
+
+cd $REPO
+bash tools/apply_kblas_patch.sh $BAZEL
+```
+
+**成功输出示例：**
+```
+Patching: /home/wanglimin/.cache/bazel/_bazel_wanglimin/xxxx/external/org_tensorflow/.../eigen_contraction_kernel.h
+OK: ...eigen_contraction_kernel.h
+Patch applied. Backup saved at: ...bak_dnnl
+```
+
+脚本是**幂等**的：重复运行输出 `Already patched. Nothing to do.`
+
+**如果报 `Header not found`**：
+说明 org_tensorflow 还没被 fetch，先不加 `--config=kml_kblas` 跑一次普通 build，
+让 Bazel 解压 TF，再执行本脚本。
+
+**如果报 `dnnl_sgemm pattern mismatch`**：
+脚本会打印实际找到的字符串，把它更新到脚本的 `old_sgemm` 变量即可。
+
+---
+
+## Step 3 — 编译命令
 
 ```bash
 BAZEL=/home/wanglimin/bazel-7.4.1
@@ -100,14 +99,16 @@ $BAZEL build -c opt \
   //tf_serving_gemm/tf_gemm_server:gemm_client
 ```
 
-### 编译后验证 KBLAS 确实链入
+> `--config=kml_kblas` 里的 `-DTENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML` 宏
+> 激活了 Step 2 patch 写入的 `cblas_sgemm` 代码路径。
 
+**编译后验证：**
 ```bash
-# 应看到：U cblas_sgemm
 nm -D bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep cblas_sgemm
+# 预期：U cblas_sgemm
 
-# 应看到：libkblas.so => /usr/local/kml/lib/libkblas.so
 ldd bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep kblas
+# 预期：libkblas.so => /usr/local/kml/lib/libkblas.so
 ```
 
 ---
@@ -135,45 +136,36 @@ kill $SERVER_PID
 
 ### kblas.h: No such file or directory
 ```bash
-find /usr/local/kml $HOME/kml -name "kblas.h" 2>/dev/null
-# 把找到的路径填入 .bazelrc 的 --copt=-I<path>
+find /usr/local/kml /home/wanglimin/kml -name "kblas.h" 2>/dev/null
 ```
 
 ### libkblas.so: cannot open shared object file（运行时）
 ```bash
-# 临时
 export LD_LIBRARY_PATH=/usr/local/kml/lib:$LD_LIBRARY_PATH
-# 永久
-echo "/usr/local/kml/lib" | sudo tee /etc/ld.so.conf.d/kml.conf && sudo ldconfig
+# 永久：echo "/usr/local/kml/lib" | sudo tee /etc/ld.so.conf.d/kml.conf && sudo ldconfig
 ```
 
-### 性能没有提升（KBLAS 未生效）
+### 性能没有提升
 ```bash
 nm -D bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep cblas_sgemm
-# 无输出说明宏未激活，检查 --config=kml_kblas 是否传入了两个 -D 宏
+# 无输出 → 检查 --config=kml_kblas 是否正确传入
 ```
 
-### patch 报 `dnnl_sgemm pattern not found`（首次 build 时）
-```bash
-# 找到 Bazel 沙箱里实际的文件，对比字符串
-find $(${BAZEL} info output_base 2>/dev/null) \
-  -name "eigen_contraction_kernel.h" 2>/dev/null | head -3
-```
-把 WORKSPACE 里 `old_sgemm` 字符串改成与实际文件一致的形式。
+### 报 `tensor_testutil.cc: CONTENT_DOES_NOT_MATCH_TARGET`
+这是 `tensorflow.patch` 本身的问题，**不要修改 WORKSPACE**（会触发 re-fetch）。
+只需运行 `tools/apply_kblas_patch.sh` 就地 patch 缓存即可。
 
 ---
 
-## 调用链说明
+## 调用链
 
 ```
 TF Session::Run(MatMul)
   → eigen::TensorContraction<float>
     → ParallelMatMulKernel  [eigen_contraction_kernel.h]
-      → cblas_sgemm(CblasColMajor, ...)   ← KBLAS patch 激活后
+      → cblas_sgemm(CblasColMajor, ...)   ← patch 激活后
         → libkblas.so  [鲲鹏 SVE/NEON 汇编]
 ```
 
-**为什么用 CblasColMajor 而不需要对调 A/B**：
-Eigen 以列主序打包矩阵块后传入内核。原 dnnl_sgemm 是行主序约定，
-需对调 A↔B 和 M↔N 来绕过。KBLAS `cblas_sgemm(CblasColMajor)` 原生支持列主序，
-直接用自然参数顺序，无需对调。
+Eigen 以列主序打包矩阵块，cblas_sgemm(CblasColMajor) 原生支持列主序，
+无需像 dnnl_sgemm（行主序约定）那样对调 A/B 和 M/N。
