@@ -6,79 +6,70 @@ description: 鲲鹏 aarch64 上用华为 KML 替换 Eigen 矩阵乘内核，编�
 
 在鲲鹏（aarch64/Kunpeng）机器上完成以下三件事：
 1. 下载安装华为 KML（鲲鹏数学库）
-2. 运行 `tools/apply_kblas_patch.sh` 直接 patch Bazel 缓存里的 eigen_contraction_kernel.h
+2. 运行 `tools/setup_kblas.sh`（一键处理所有编译前依赖）
 3. 编译 gemm_server / gemm_client 并验证 KBLAS 替换生效
 
 **重要约束**：TF 已编译过，不要 `bazel clean --expunge`。
-本方案不修改 WORKSPACE（避免 Bazel 重新 fetch TF），改为独立脚本就地 patch 缓存文件。
 
 ---
 
-## Step 1 — 下载并安装 KML
+## Step 1 — 安装 KML
 
 ```bash
-# 下载 RPM（~40 MB）
 wget -O /tmp/boostkit-kml-1.7.0-1.aarch64.rpm \
   https://repo.oepkgs.net/openeuler/rpm/openEuler-20.03-LTS-SP3/extras/aarch64/Packages/b/boostkit-kml-1.7.0-1.aarch64.rpm
 
-# 方式 A：有 sudo，直接安装到 /usr/local/kml/
+# 有 sudo（推荐）
 sudo rpm -ivh /tmp/boostkit-kml-1.7.0-1.aarch64.rpm
 
-# 方式 B：无 root，解压到用户目录
+# 无 root
 mkdir -p /home/wanglimin/kml
 rpm2cpio /tmp/boostkit-kml-1.7.0-1.aarch64.rpm | cpio -idmv --no-absolute-filenames -D /home/wanglimin/kml
-# 找到实际子目录，例如 /home/wanglimin/kml/usr/local/kml/
 ```
 
 **验证：**
 ```bash
-KML_ROOT=/usr/local/kml          # 方式 B 改为实际路径
-ls $KML_ROOT/include/kblas.h     # 必须存在
-ls $KML_ROOT/lib/libkblas.so     # 必须存在
-nm -D $KML_ROOT/lib/libkblas.so | grep cblas_sgemm   # 必须有输出
-```
-
-**如果 KML 装在非默认路径**，修改 `.bazelrc`：
-```bash
-KML_ACTUAL=/home/wanglimin/kml/usr/local/kml   # 改成实际路径
-sed -i "s|/usr/local/kml/include|$KML_ACTUAL/include|g" .bazelrc
-sed -i "s|/usr/local/kml/lib|$KML_ACTUAL/lib|g"         .bazelrc
+KML_ROOT=/usr/local/kml    # 无 root 改成实际子目录
+ls $KML_ROOT/include/kblas.h && ls $KML_ROOT/lib/libkblas.so
+nm -D $KML_ROOT/lib/libkblas.so | grep cblas_sgemm
 ```
 
 ---
 
-## Step 2 — 运行 KBLAS patch 脚本
+## Step 2 — 一键 Setup（`tools/setup_kblas.sh`）
 
-脚本直接修改 Bazel output base 里已解压的 `eigen_contraction_kernel.h`，
-**不碰 WORKSPACE，Bazel 指纹不变，之前的编译缓存全部保留**。
+这个脚本处理以下三件事，每件都是幂等的：
+
+| 子步骤 | 做什么 | 出错时怎么处理 |
+|--------|--------|----------------|
+| **repo.bzl 修复** | 检查 `tensorflow_serving/repo.bzl` 是否有 `tf_serving_vendored`，没有则自动追加 | 自动修复 |
+| **`.bazelrc` 路径** | KML 不在默认 `/usr/local/kml` 时，自动 `sed` 修改路径 | 传第二个参数指定路径 |
+| **头文件 patch** | 在 Bazel 缓存就地替换 `dnnl_sgemm → cblas_sgemm`（正则匹配，容忍不同 TF 版本） | 缓存不存在时提示先跑一次普通 build |
 
 ```bash
-BAZEL=/home/wanglimin/bazel-7.4.1   # 改成实际路径
-REPO=/home/wanglimin/tf_serving      # 改成仓库根目录
+BAZEL=/home/wanglimin/bazel-7.4.1
+cd /home/wanglimin/tf_serving
 
-cd $REPO
-bash tools/apply_kblas_patch.sh $BAZEL
+# KML 在默认路径 /usr/local/kml
+bash tools/setup_kblas.sh $BAZEL
+
+# KML 在自定义路径
+bash tools/setup_kblas.sh $BAZEL /home/wanglimin/kml/usr/local/kml
 ```
 
-**成功输出示例：**
+**如果提示 "patch deferred"（头文件不在缓存）**，先触发一次普通编译让 Bazel 解压 TF，再重跑 setup：
+
+```bash
+$BAZEL build -c opt --distdir=/home/wanglimin/tf_new/dist \
+  --define=no_cuda_support=true --define=no_nccl_support=true \
+  //tf_serving_gemm/tf_gemm_server:gemm_server 2>&1 | tail -5
+
+bash tools/setup_kblas.sh $BAZEL
 ```
-Patching: /home/wanglimin/.cache/bazel/_bazel_wanglimin/xxxx/external/org_tensorflow/.../eigen_contraction_kernel.h
-OK: ...eigen_contraction_kernel.h
-Patch applied. Backup saved at: ...bak_dnnl
-```
-
-脚本是**幂等**的：重复运行输出 `Already patched. Nothing to do.`
-
-**如果报 `Header not found`**：
-说明 org_tensorflow 还没被 fetch，先不加 `--config=kml_kblas` 跑一次普通 build，
-让 Bazel 解压 TF，再执行本脚本。
-
-**如果报 `dnnl_sgemm pattern mismatch`**：
-脚本会打印实际找到的字符串，把它更新到脚本的 `old_sgemm` 变量即可。
 
 ---
 
-## Step 3 — 编译命令
+## Step 3 — 编译
 
 ```bash
 BAZEL=/home/wanglimin/bazel-7.4.1
@@ -99,61 +90,58 @@ $BAZEL build -c opt \
   //tf_serving_gemm/tf_gemm_server:gemm_client
 ```
 
-> `--config=kml_kblas` 里的 `-DTENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML` 宏
-> 激活了 Step 2 patch 写入的 `cblas_sgemm` 代码路径。
-
-**编译后验证：**
+**验证：**
 ```bash
 nm -D bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep cblas_sgemm
-# 预期：U cblas_sgemm
-
 ldd bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep kblas
-# 预期：libkblas.so => /usr/local/kml/lib/libkblas.so
 ```
 
 ---
 
-## Step 4 — 运行测试
+## Step 4 — 测试
 
 ```bash
-# 启动 server
 ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server --addr=0.0.0.0:50052 &
-SERVER_PID=$!
 sleep 2
-
-# 快速验证
-./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client --iters=30 --warmup=5
-
-# 稳定性测试（和原来用法完全一样）
 ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client --iters=200 --warmup=50
-
-kill $SERVER_PID
+kill %1
 ```
 
 ---
 
 ## 常见问题
 
-### kblas.h: No such file or directory
+### `tf_serving_vendored` 找不到（编译报错）
+`setup_kblas.sh` 会自动修复。手动修复：
+```bash
+cat >> tensorflow_serving/repo.bzl << 'EOF'
+
+def _tf_serving_vendored_impl(ctx):
+    ctx.symlink(ctx.path(ctx.attr.root).dirname.get_child(ctx.attr.path), ".")
+
+tf_serving_vendored = repository_rule(
+    implementation = _tf_serving_vendored_impl,
+    attrs = {
+        "root": attr.label(mandatory = True),
+        "path": attr.string(mandatory = True),
+    },
+)
+EOF
+```
+
+### `kblas.h: No such file or directory`
 ```bash
 find /usr/local/kml /home/wanglimin/kml -name "kblas.h" 2>/dev/null
+bash tools/setup_kblas.sh /home/wanglimin/bazel-7.4.1 <KML根目录>
 ```
 
-### libkblas.so: cannot open shared object file（运行时）
+### `libkblas.so: cannot open shared object file`（运行时）
 ```bash
 export LD_LIBRARY_PATH=/usr/local/kml/lib:$LD_LIBRARY_PATH
-# 永久：echo "/usr/local/kml/lib" | sudo tee /etc/ld.so.conf.d/kml.conf && sudo ldconfig
 ```
 
-### 性能没有提升
-```bash
-nm -D bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep cblas_sgemm
-# 无输出 → 检查 --config=kml_kblas 是否正确传入
-```
-
-### 报 `tensor_testutil.cc: CONTENT_DOES_NOT_MATCH_TARGET`
-这是 `tensorflow.patch` 本身的问题，**不要修改 WORKSPACE**（会触发 re-fetch）。
-只需运行 `tools/apply_kblas_patch.sh` 就地 patch 缓存即可。
+### `tensor_testutil.cc: CONTENT_DOES_NOT_MATCH_TARGET`
+**不要改 WORKSPACE**，只跑 `tools/setup_kblas.sh` 就地 patch 缓存。
 
 ---
 
@@ -166,6 +154,3 @@ TF Session::Run(MatMul)
       → cblas_sgemm(CblasColMajor, ...)   ← patch 激活后
         → libkblas.so  [鲲鹏 SVE/NEON 汇编]
 ```
-
-Eigen 以列主序打包矩阵块，cblas_sgemm(CblasColMajor) 原生支持列主序，
-无需像 dnnl_sgemm（行主序约定）那样对调 A/B 和 M/N。

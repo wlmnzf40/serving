@@ -4,13 +4,13 @@
 # 用法：
 #   bash tools/apply_kblas_patch.sh [BAZEL_BIN]
 #
-# 作用：在 Bazel output_base 里已解压的 eigen_contraction_kernel.h 中：
-#   - 把 dnnl_sgemm() 替换成 cblas_sgemm(CblasColMajor, ...)
-#   - 把 #include "dnnl.h" 替换成 #include "kblas.h"
-#   - 重命名宏（避免依赖 dnnl 编译时头文件）
+# 关键设计：
+#   不使用 #include "kblas.h"，改为内联前向声明 cblas_sgemm。
+#   这样完全不需要 -I 编译器标志，Bazel hermetic 工具链不会报
+#   "path outside of the execution root" 错误。
+#   链接期仍需 -lkblas（由 .bazelrc kml_kblas config 提供）。
 #
-# 不修改 WORKSPACE，已有编译缓存完全保留。
-# 脚本是幂等的，重复执行安全无副作用。
+# 不修改 WORKSPACE，已有编译缓存完全保留。幂等，重复运行安全。
 
 set -euo pipefail
 
@@ -64,35 +64,46 @@ if 'TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL' in src:
         'TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL',
         'TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML')
     changed = True
+    print("  macro renamed")
 
-# ── 2. 头文件替换 ─────────────────────────────────────────────────────────────
-if '#include "dnnl.h"' in src:
-    src = src.replace('#include "dnnl.h"', '#include "kblas.h"')
+# ── 2. #include "dnnl.h" → 内联前向声明（无需外部头文件，不需要 -I 标志）────
+# 用标准 CBLAS 前向声明替代 #include "kblas.h"，链接期 -lkblas 提供实现。
+# 这样 Bazel hermetic 工具链不会报 "path outside of execution root"。
+KBLAS_DECL = '''\
+// KML KBLAS forward declarations (replaces dnnl.h; no -I flag needed).
+// Symbols resolved at link time by -lkblas.
+extern "C" {
+enum CBLAS_ORDER     { CblasRowMajor = 101, CblasColMajor = 102 };
+enum CBLAS_TRANSPOSE { CblasNoTrans  = 111, CblasTrans    = 112, CblasConjTrans = 113 };
+void cblas_sgemm(CBLAS_ORDER Order,
+                 CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
+                 int M, int N, int K,
+                 float alpha, const float* A, int lda,
+                              const float* B, int ldb,
+                 float beta,        float* C, int ldc);
+}  // extern "C"'''
+
+old_include = '#include "dnnl.h"'
+if old_include in src:
+    src = src.replace(old_include, KBLAS_DECL)
     changed = True
+    print("  dnnl.h → inline cblas_sgemm forward declaration")
+elif 'kblas' not in src:
+    print("WARNING: neither 'dnnl.h' nor 'kblas' found in header (skipping include step)",
+          file=sys.stderr)
 
 # ── 3. dnnl_sgemm → cblas_sgemm（正则匹配，容忍换行和缩进差异）──────────────
-#
-# dnnl_sgemm 签名（行主序约定，A/B 和 m/n 对调了）：
-#   dnnl_sgemm(transposeB, transposeA, n, m, k, alpha,
-#              blockB, ldB, blockA, ldA, beta, output_ptr, ldC)
-#
-# cblas_sgemm 签名（列主序，自然顺序）：
-#   cblas_sgemm(CblasColMajor, transA_flag, transB_flag, m, n, k, alpha,
-#               blockA, ldA, blockB, ldB, beta, output_ptr, ldC)
-#
-# 正则捕获 13 个参数，按语义重组——不依赖具体缩进/空格/换行。
-
 PAT_SGEMM = re.compile(
-    r'dnnl_status_t\s+st\s*=\s*'            # dnnl_status_t st =
-    r'(?:\n\s*)?'                            # 可选换行+缩进
+    r'dnnl_status_t\s+st\s*=\s*'
+    r'(?:\n\s*)?'
     r'dnnl_sgemm\s*\('
-    r'\s*([^,]+?)\s*,'   # 1: transposeB
+    r'\s*([^,]+?)\s*,'   # 1: transposeB (dnnl swap)
     r'\s*([^,]+?)\s*,'   # 2: transposeA
-    r'\s*([^,]+?)\s*,'   # 3: n
+    r'\s*([^,]+?)\s*,'   # 3: n (dnnl swap)
     r'\s*([^,]+?)\s*,'   # 4: m
     r'\s*([^,]+?)\s*,'   # 5: k
     r'\s*([^,]+?)\s*,'   # 6: alpha
-    r'\s*([^,]+?)\s*,'   # 7: blockB
+    r'\s*([^,]+?)\s*,'   # 7: blockB (dnnl swap)
     r'\s*([^,]+?)\s*,'   # 8: ldB
     r'\s*([^,]+?)\s*,'   # 9: blockA
     r'\s*([^,]+?)\s*,'   # 10: ldA
@@ -100,7 +111,7 @@ PAT_SGEMM = re.compile(
     r'\s*([^,]+?)\s*,'   # 12: output_ptr
     r'\s*([^)]+?)\s*'    # 13: ldC
     r'\)\s*;'
-    r'(?:\s*\n\s*eigen_assert\s*\(\s*st\s*==\s*0\s*\)\s*;)?',  # 可选的 assert
+    r'(?:\s*\n\s*eigen_assert\s*\(\s*st\s*==\s*0\s*\)\s*;)?',
     re.DOTALL
 )
 
@@ -118,6 +129,7 @@ def _build_cblas(m):
     beta       = m.group(11).strip()
     output_ptr = m.group(12).strip()
     ldC        = m.group(13).strip()
+    # cblas(CblasColMajor) 自然顺序，无需 A/B 和 m/n 对调
     return (
         f"cblas_sgemm(CblasColMajor,\n"
         f"                {transposeA} == 'N' ? CblasNoTrans : CblasTrans,\n"
@@ -134,19 +146,16 @@ if cnt > 0:
     changed = True
     print(f"  dnnl_sgemm → cblas_sgemm  ({cnt} occurrence(s))")
 elif 'dnnl_sgemm' in src:
-    # 找到了函数但正则没匹配——打印上下文帮助调试
     m = re.search(r'dnnl_sgemm\s*\(.*?\)\s*;', src, re.DOTALL)
-    print("WARNING: dnnl_sgemm 找到了但正则未匹配，请把以下内容反馈给维护者：",
+    print("WARNING: dnnl_sgemm found but regex didn't match. Actual content:",
           file=sys.stderr)
-    print(repr(m.group(0)) if m else "(no match object)", file=sys.stderr)
+    print(repr(m.group(0)) if m else "(no match)", file=sys.stderr)
 else:
-    print("  dnnl_sgemm: not found in this TF version (skipped)")
+    print("  dnnl_sgemm: not found (skipped)")
 
-# ── 4. dnnl_gemm_u8s8s32 → memset 置零（KML 无 int8 GEMM）─────────────────
+# ── 4. dnnl_gemm_u8s8s32 → memset（KML 无 int8 GEMM）────────────────────────
 PAT_U8S8 = re.compile(
-    r'dnnl_status_t\s+st\s*=\s*dnnl_gemm_u8s8s32\s*\('
-    r'.*?'
-    r'\)\s*;'
+    r'dnnl_status_t\s+st\s*=\s*dnnl_gemm_u8s8s32\s*\(.*?\)\s*;'
     r'(?:\s*\n\s*eigen_assert\s*\(\s*st\s*==\s*0\s*\)\s*;)?',
     re.DOTALL
 )
@@ -165,7 +174,7 @@ elif 'dnnl_gemm_u8s8s32' in src:
 else:
     print("  dnnl_gemm_u8s8s32: not found (skipped)")
 
-# ── 5. 清理悬空的 EIGEN_UNUSED_VARIABLE(st)（出现时才删）───────────────────
+# ── 5. 清理悬空的 EIGEN_UNUSED_VARIABLE(st) ──────────────────────────────────
 new_src = re.sub(r'\s*EIGEN_UNUSED_VARIABLE\s*\(\s*st\s*\)\s*;', '', src)
 if new_src != src:
     src = new_src
@@ -176,9 +185,8 @@ if new_src != src:
 if 'dnnl_sgemm' in src:
     print("ERROR: dnnl_sgemm still present after patch!", file=sys.stderr)
     sys.exit(1)
-
 if not changed:
-    print("Nothing was changed (header may already be patched or different TF version)")
+    print("Nothing changed (already patched or different TF version)")
     sys.exit(0)
 
 with open(header, 'w') as f:
@@ -189,7 +197,7 @@ PYEOF
 echo ""
 echo "Patch applied. Backup: ${HEADER}.bak_dnnl"
 echo ""
-echo "Now build:"
+echo "Build command:"
 echo "  $BAZEL build -c opt --config=kml_kblas \\"
 echo "    --distdir=/home/wanglimin/tf_new/dist \\"
 echo "    --define=no_cuda_support=true --define=no_nccl_support=true \\"
