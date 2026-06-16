@@ -37,13 +37,10 @@ cc_grpc_library(
     deps = [":gemm_cc_proto"],
 )
 
-# ── Server (TF C++ Session + MatMul op kernel) ────────────────────────────────
-# Three distinct link-time requirements:
-#   direct_session : registers the local-process SessionFactory (target: "")
-#                    without this you get "No session factory registered" at startup
-#   all_kernels    : links the MatMul compute kernel
-#                    without this you get "No OpKernel registered for MatMul" at Run()
-#   core_cpu       : TF executor / threadpool runtime
+# ── Server (direct BLAS/Eigen dispatch — no TF Session in hot path) ──────────
+# framework is kept for the transitive Eigen include path.
+# Built without --config=kml_kblas: Eigen only  (--backend=eigen, default)
+# Built with    --config=kml_kblas: KBLAS + Eigen (--backend=kblas|eigen, default=kblas)
 
 cc_binary(
     name = "gemm_server",
@@ -51,13 +48,7 @@ cc_binary(
     deps = [
         ":gemm_cc_grpc",
         ":gemm_cc_proto",
-        "@org_tensorflow//tensorflow/cc:cc_ops",           # MatMul / Placeholder graph builders
-        "@org_tensorflow//tensorflow/cc:client_session",
-        "@org_tensorflow//tensorflow/core:all_kernels",    # MatMul compute kernel
-        "@org_tensorflow//tensorflow/core:core_cpu",       # executor / threadpool runtime
-        "@org_tensorflow//tensorflow/core:direct_session", # local SessionFactory (REQUIRED)
-        "@org_tensorflow//tensorflow/core:framework",
-        "@org_tensorflow//tensorflow/core:lib",
+        "@org_tensorflow//tensorflow/core:framework",  # provides Eigen include path
         "@com_github_grpc_grpc//:grpc++",
     ],
 )

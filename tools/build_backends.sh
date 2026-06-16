@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
-# build_backends.sh — 分别编译 KBLAS 版和 Eigen 版 gemm_server，
-# 输出为 bazel-bin/.../gemm_server_kblas 和 gemm_server_eigen
+# build_backends.sh — 编译 GEMM server（单个 binary 支持 --backend=kblas|eigen 运行时切换）
 #
 # 用法：
 #   bash tools/build_backends.sh [BAZEL_BIN]
 #
-# 原理：
-#   - KBLAS 版：--config=kml_kblas 激活 -DTENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
-#               eigen_contraction_kernel.h 里的 cblas_sgemm 代码路径被编译进去
-#   - Eigen 版：不传 --config=kml_kblas，宏未定义，#ifdef 块不激活，
-#               落回 Eigen 原生 GEBP 内核，不依赖 libkblas.so
+# 输出：
+#   bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server   ← 同时支持两种 backend
+#   bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client
+#
+# 运行时切换：
+#   ./gemm_server --backend=kblas --addr=0.0.0.0:50052   # 使用 KML cblas_sgemm
+#   ./gemm_server --backend=eigen --addr=0.0.0.0:50053   # 使用 Eigen 矩阵乘
+#
+#   或直接用对比脚本：
+#     bash tools/compare_backends.sh
 
 set -euo pipefail
 
 BAZEL="${1:-/home/wanglimin/bazel-7.4.1}"
 DISTDIR="${DISTDIR:-/home/wanglimin/tf_new/dist}"
 GCC_RPATH="${GCC_RPATH:-/home/wanglimin/gcc-12.3.1-2025.12-aarch64-linux/lib64}"
-
-SERVER_BIN="bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server"
-CLIENT_BIN="bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client"
 
 COMMON_FLAGS=(
     -c opt
@@ -37,21 +38,19 @@ TARGETS=(
     //tf_serving_gemm/tf_gemm_server:gemm_client
 )
 
-# ── 1. Build KBLAS 版 ─────────────────────────────────────────────────────────
-echo "=== Building KBLAS backend ==="
+echo "=== Building gemm_server + gemm_client (--config=kml_kblas) ==="
+echo "    Supports --backend=kblas|eigen at runtime"
 "$BAZEL" build "${COMMON_FLAGS[@]}" --config=kml_kblas "${TARGETS[@]}"
-cp "$SERVER_BIN" "${SERVER_BIN}_kblas"
-cp "$CLIENT_BIN" "${CLIENT_BIN}_kblas" 2>/dev/null || true
-echo "→ ${SERVER_BIN}_kblas"
-
-# ── 2. Build Eigen 版（不传 kml_kblas，宏不激活，不链 kblas）────────────────
-echo ""
-echo "=== Building Eigen backend ==="
-"$BAZEL" build "${COMMON_FLAGS[@]}" "${TARGETS[@]}"
-cp "$SERVER_BIN" "${SERVER_BIN}_eigen"
-cp "$CLIENT_BIN" "${CLIENT_BIN}_eigen" 2>/dev/null || true
-echo "→ ${SERVER_BIN}_eigen"
 
 echo ""
-echo "=== Done. Run comparison with: ==="
+echo "=== Done ==="
+echo ""
+echo "Quick test (two terminals or use compare_backends.sh):"
+echo "  export LD_LIBRARY_PATH=\$KML_LIB:\$LD_LIBRARY_PATH"
+echo "  ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server --backend=kblas &"
+echo "  ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server --backend=eigen --addr=0.0.0.0:50053 &"
+echo "  ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client --host=localhost:50052  # KBLAS"
+echo "  ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client --host=localhost:50053  # Eigen"
+echo ""
+echo "Or run the full comparison:"
 echo "  bash tools/compare_backends.sh"

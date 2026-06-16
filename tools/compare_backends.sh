@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# compare_backends.sh — 并行启动 KBLAS 和 Eigen 两个 server，跑相同 benchmark，打印对比
+# compare_backends.sh — 同一个 binary，--backend=kblas 和 --backend=eigen 各跑一次，打印 GFLOPS 对比
 #
 # 用法：
 #   bash tools/compare_backends.sh [MODE] [EXTRA_CLIENT_FLAGS...]
@@ -36,19 +36,18 @@ if [[ -z "$KML_LIB" ]]; then
 fi
 
 if [[ -z "$KML_LIB" ]]; then
-    echo "WARNING: libkblas.so not found. KBLAS server may crash."
+    echo "WARNING: libkblas.so not found. KBLAS backend may crash."
     echo "  Set KML_LIB=/path/to/dir/containing/libkblas.so before running."
 fi
 
-SERVER_KBLAS="./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server_kblas"
-SERVER_EIGEN="./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server_eigen"
+SERVER="./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server"
 CLIENT="./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client"
 
 PORT_KBLAS=50052
 PORT_EIGEN=50053
 
-if [[ ! -f "$SERVER_KBLAS" ]] || [[ ! -f "$SERVER_EIGEN" ]]; then
-    echo "ERROR: 先运行 bash tools/build_backends.sh 编译两个版本"
+if [[ ! -f "$SERVER" ]]; then
+    echo "ERROR: $SERVER not found. Run: bash tools/build_backends.sh"
     exit 1
 fi
 if [[ ! -f "$CLIENT" ]]; then
@@ -65,20 +64,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── 启动两个 server ───────────────────────────────────────────────────────────
-echo "Starting KBLAS server  (port $PORT_KBLAS)..."
+# ── 启动两个实例：同一个 binary，不同 --backend ──────────────────────────────
+echo "Starting KBLAS backend  (port $PORT_KBLAS)..."
 LD_LIBRARY_PATH="${KML_LIB:+$KML_LIB:}${LD_LIBRARY_PATH:-}" \
-    "$SERVER_KBLAS" --addr="0.0.0.0:$PORT_KBLAS" > /tmp/kblas_server.log 2>&1 &
+    "$SERVER" --addr="0.0.0.0:$PORT_KBLAS" --backend=kblas \
+    > /tmp/kblas_server.log 2>&1 &
 PID_KBLAS=$!
 
-echo "Starting Eigen server  (port $PORT_EIGEN)..."
-"$SERVER_EIGEN" --addr="0.0.0.0:$PORT_EIGEN" > /tmp/eigen_server.log 2>&1 &
+echo "Starting Eigen backend  (port $PORT_EIGEN)..."
+LD_LIBRARY_PATH="${KML_LIB:+$KML_LIB:}${LD_LIBRARY_PATH:-}" \
+    "$SERVER" --addr="0.0.0.0:$PORT_EIGEN" --backend=eigen \
+    > /tmp/eigen_server.log 2>&1 &
 PID_EIGEN=$!
 
 echo "Waiting for servers to initialize..."
-sleep 4
+sleep 2
 
-# 检查两个 server 是否还在跑
+# 检查两个实例是否还在跑
 if ! kill -0 "$PID_KBLAS" 2>/dev/null; then
     echo "ERROR: KBLAS server crashed. Log:"
     cat /tmp/kblas_server.log
