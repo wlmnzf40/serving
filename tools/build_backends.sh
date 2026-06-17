@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # build_backends.sh — 编译 GEMM server（单个 binary 支持 --backend=kblas|eigen 运行时切换）
 #
+# 前提：tools/setup_kblas.sh（或 tools/apply_kblas_patch.sh）必须已经成功 patch 过
+# Bazel cache 里的 eigen_contraction_kernel.h —— --backend 这个运行时开关
+# (tf_serving_kblas_enabled) 是这个 patch 加进 TF 内核里的，不是 server.cc 自己实现的。
+# 没 patch 过的话这里编译出的 binary 里 --backend=kblas 会在启动时直接报错。
+#
 # 用法：
 #   bash tools/build_backends.sh [BAZEL_BIN]
 #
@@ -8,9 +13,10 @@
 #   bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server   ← 同时支持两种 backend
 #   bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client
 #
-# 运行时切换：
-#   ./gemm_server --backend=kblas --addr=0.0.0.0:50052   # 使用 KML cblas_sgemm
-#   ./gemm_server --backend=eigen --addr=0.0.0.0:50053   # 使用 Eigen 矩阵乘
+# 运行时切换（两者走同一条 Session::Run -> MatMulOp -> Eigen::Tensor::contract()
+# 路径，只是最底层 GEMM 调用不同）：
+#   ./gemm_server --backend=kblas --addr=0.0.0.0:50052   # 内核里调 cblas_sgemm
+#   ./gemm_server --backend=eigen --addr=0.0.0.0:50053   # 内核里调 Eigen 原生实现
 #
 #   或直接用对比脚本：
 #     bash tools/compare_backends.sh

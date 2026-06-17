@@ -114,20 +114,21 @@ else
     echo "[2/3] .bazelrc: kml_kblas linkopt not found (unexpected). Please check .bazelrc manually."
 fi
 
-# ── Step 3 (可选): patch eigen_contraction_kernel.h ───────────────────────────
-# 仅用于让 TF 内部 MatMul/BatchMatMul 全局走 KBLAS。
-# gemm_server --backend=kblas|eigen 直接调用 cblas_sgemm/Eigen::Map，不依赖这个 patch，
-# 跳过本步骤完全不影响 build_backends.sh / compare_backends.sh 的使用。
+# ── Step 3 (必需): patch eigen_contraction_kernel.h ───────────────────────────
+# gemm_server --backend=kblas|eigen 是 TF Session -> MatMulOp -> Eigen::Tensor::
+# contract() 的同一条调用路径，运行时开关 tf_serving_kblas_enabled 是这个 patch
+# 加进头文件里的——没有这个 patch，--backend 这个开关在 TF 内核里根本不存在，
+# --backend=kblas 会在启动时报错而不是静默退化成 Eigen。这一步不能跳过。
 
 if [[ ! -x "$BAZEL" ]]; then
-    echo "[3/3] bazel not found at $BAZEL — skipping header patch (optional, see below)"
+    echo "[3/3] bazel not found at $BAZEL — skipping header patch"
+    echo "  请在安装好 bazel 后单独运行（--backend=kblas 在此之前不可用）："
+    echo "    bash $SCRIPT_DIR/apply_kblas_patch.sh $BAZEL"
     echo ""
-    echo "=== Setup complete (header patch skipped) ==="
+    echo "=== Setup complete (patch skipped) ==="
     echo ""
-    echo "repo.bzl 和 .bazelrc 已就绪，gemm_server --backend=kblas|eigen 不依赖头文件 patch，"
-    echo "可以直接编译（见 tools/build_backends.sh）。"
-    echo "头文件 patch 只在你想让 TF 内部 MatMul 全局走 KBLAS 时才需要："
-    echo "  bash $SCRIPT_DIR/apply_kblas_patch.sh $BAZEL"
+    echo "repo.bzl 和 .bazelrc 已就绪，但 gemm_server 还不能用 --backend=kblas，"
+    echo "先装好 bazel 再跑一次本脚本，或直接跑 apply_kblas_patch.sh。"
     exit 0
 fi
 
@@ -138,12 +139,14 @@ if [[ -n "$OUTPUT_BASE" ]]; then
 fi
 
 if [[ -z "$OUTPUT_BASE" ]] || [[ ! -f "$HEADER" ]]; then
-    echo "[3/3] eigen_contraction_kernel.h: Bazel cache 里还没有这个文件（可选步骤，跳过）。"
-    echo "  只有想让 TF 内部 MatMul 全局走 KBLAS 时才需要这个 patch；如需要："
+    echo "[3/3] eigen_contraction_kernel.h: Bazel cache 里还没有这个文件。"
     echo "  先不加 --config=kml_kblas 跑一次普通 build 让 Bazel 解压 TF，"
     echo "  然后重新执行本脚本，或直接跑 tools/apply_kblas_patch.sh。"
     echo ""
-    echo "=== Setup complete (optional header patch deferred) ==="
+    echo "=== Setup complete (patch deferred) ==="
+    echo ""
+    echo "repo.bzl 和 .bazelrc 已就绪，但 gemm_server 还不能用 --backend=kblas，"
+    echo "直到上面的 patch 步骤跑完为止。"
     exit 0
 fi
 

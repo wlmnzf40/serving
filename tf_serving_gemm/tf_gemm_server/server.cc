@@ -1,57 +1,60 @@
 /*
- * GEMM gRPC server — direct BLAS / Eigen dispatch, no TF Session in hot path.
+ * GEMM gRPC server — backed by the TensorFlow C++ runtime.
+ *
+ * RPCs:
+ *   Compute    — single MatMul with client-supplied data
+ *   Sweep      — server-side benchmark for square sizes
+ *   ShapeSweep — server-side benchmark for arbitrary production shapes
+ *                (batch=1 → plain MatMul, batch>1 → BatchMatMul)
  *
  * Flags:
- *   --addr=host:port     listen address           (default 0.0.0.0:50052)
- *   --backend=kblas      cblas_sgemm from libkblas.so  (requires --config=kml_kblas build)
- *   --backend=eigen      Eigen matrix multiply          (always available)
+ *   --addr=host:port   listen address            (default 0.0.0.0:50052)
+ *   --backend=kblas    innermost GEMM uses cblas_sgemm (libkblas.so)
+ *   --backend=eigen    innermost GEMM uses Eigen's native kernel
  *
- * Build:
- *   --config=kml_kblas   links libkblas.so; both --backend values work; default=kblas
- *   (no config)          Eigen only; --backend=kblas prints an error; default=eigen
+ * Both values run the identical Session::Run -> MatMulOp/BatchMatMulOp ->
+ * Eigen::Tensor::contract() call path — the flag only flips
+ * tf_serving_kblas_enabled, a runtime switch read inside the patched
+ * eigen_contraction_kernel.h (see tools/apply_kblas_patch.sh). That patch is a
+ * required prerequisite: it's what makes the switch and --config=kml_kblas
+ * build exist in the first place. Without it, --backend=kblas fails fast
+ * below instead of silently running Eigen.
  *
- * Examples:
- *   ./gemm_server --backend=kblas               # KBLAS, port 50052
- *   ./gemm_server --backend=eigen --addr=:50053 # Eigen, port 50053
+ * Build (same flags as tensorflow_model_server, different target):
+ *   //tf_serving_gemm/tf_gemm_server:gemm_server
  */
 
 #include <algorithm>
 #include <chrono>
-#include <cstring>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <string>
 #include <vector>
 
-#include "Eigen/Core"
+#include "tensorflow/cc/client/client_session.h"
+#include "tensorflow/cc/ops/standard_ops.h"
+#include "tensorflow/core/framework/tensor.h"
 
 #include "grpcpp/grpcpp.h"
 #include "tf_serving_gemm/tf_gemm_server/proto/gemm.grpc.pb.h"
 #include "tf_serving_gemm/tf_gemm_server/proto/gemm.pb.h"
 
-// ── cblas forward declarations (inlined — no -I flag needed) ─────────────────
-#ifdef TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
-extern "C" {
-enum CBLAS_ORDER     { CblasRowMajor = 101, CblasColMajor = 102 };
-enum CBLAS_TRANSPOSE { CblasNoTrans  = 111, CblasTrans    = 112,
-                       CblasConjTrans = 113 };
-void cblas_sgemm(CBLAS_ORDER Order,
-                 CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
-                 int M, int N, int K,
-                 float alpha, const float* A, int lda,
-                              const float* B, int ldb,
-                 float beta,        float* C, int ldc);
-}
-#endif
-
+namespace tf    = tensorflow;
+namespace tfops = tensorflow::ops;
 using Clock = std::chrono::steady_clock;
-using MatRM = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
-// ── runtime backend selection ─────────────────────────────────────────────────
-
-enum class Backend { kKBLAS, kEigen };
-static Backend g_backend;
+// Runtime switch read by the patched eigen_contraction_kernel.h. Defined here
+// (not in the header) so --backend flips one process-wide flag instead of
+// requiring a rebuild; every Session::Run() afterwards picks it up at the
+// innermost GEMM call inside Eigen::Tensor::contract(). Only declared when
+// the binary is built --config=kml_kblas, since that's the only configuration
+// where the patched header references it.
+#ifdef TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
+extern "C" int tf_serving_kblas_enabled = 1;
+#endif
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -64,55 +67,91 @@ static Stats compute_stats(std::vector<double> v) {
     return {s / v.size(), v[v.size() / 2], v[v.size() * 99 / 100]};
 }
 
-static void fill_random(float* data, int n) {
+// 2-D random tensor [rows, cols]
+static tf::Tensor make_random(int rows, int cols) {
+    tf::Tensor t(tf::DT_FLOAT, tf::TensorShape({rows, cols}));
     std::mt19937 rng(42);
     std::normal_distribution<float> dist;
-    for (int i = 0; i < n; ++i) data[i] = dist(rng);
+    auto flat = t.flat<float>();
+    for (int i = 0; i < flat.size(); ++i) flat.data()[i] = dist(rng);
+    return t;
 }
 
-// ── core dispatch: C[M,N] = A[M,K] × B[K,N]  (row-major, fp32) ──────────────
+// 3-D random tensor [batch, rows, cols] for BatchMatMul
+static tf::Tensor make_random_3d(int batch, int rows, int cols) {
+    tf::Tensor t(tf::DT_FLOAT, tf::TensorShape({batch, rows, cols}));
+    std::mt19937 rng(42);
+    std::normal_distribution<float> dist;
+    auto flat = t.flat<float>();
+    for (int i = 0; i < flat.size(); ++i) flat.data()[i] = dist(rng);
+    return t;
+}
 
-static double direct_sgemm(const float* A, const float* B, float* C,
-                            int M, int K, int N) {
-    auto t0 = Clock::now();
-#ifdef TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
-    if (g_backend == Backend::kKBLAS) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    M, N, K, 1.0f, A, K, B, N, 0.0f, C, N);
-    } else
-#endif
-    {
-        Eigen::Map<const MatRM> eA(A, M, K);
-        Eigen::Map<const MatRM> eB(B, K, N);
-        Eigen::Map<MatRM>       eC(C, M, N);
-        eC.noalias() = eA * eB;
+// ── GEMMRunner (batch=1, plain MatMul) ────────────────────────────────────────
+
+class GEMMRunner {
+public:
+    GEMMRunner() : scope_(tf::Scope::NewRootScope()) {
+        auto ph_a = tfops::Placeholder(scope_.WithOpName("A"), tf::DT_FLOAT);
+        auto ph_b = tfops::Placeholder(scope_.WithOpName("B"), tf::DT_FLOAT);
+        auto mm   = tfops::MatMul(scope_.WithOpName("C"), ph_a, ph_b);
+        TF_CHECK_OK(scope_.status());
+        A_ph_ = ph_a;
+        B_ph_ = ph_b;
+        C_op_ = mm;
+        session_ = std::make_unique<tf::ClientSession>(scope_);
     }
-    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-}
 
-// C[b,M,N] = A[b,M,K] × B[b,K,N]
-static double direct_batch_sgemm(const float* A, const float* B, float* C,
-                                  int b, int M, int K, int N) {
-    auto t0 = Clock::now();
-    for (int i = 0; i < b; ++i) {
-        const float* ai = A + i * M * K;
-        const float* bi = B + i * K * N;
-        float*       ci = C + i * M * N;
-#ifdef TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
-        if (g_backend == Backend::kKBLAS) {
-            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                        M, N, K, 1.0f, ai, K, bi, N, 0.0f, ci, N);
-        } else
-#endif
-        {
-            Eigen::Map<const MatRM> eA(ai, M, K);
-            Eigen::Map<const MatRM> eB(bi, K, N);
-            Eigen::Map<MatRM>       eC(ci, M, N);
-            eC.noalias() = eA * eB;
-        }
+    double Run(const tf::Tensor& A, const tf::Tensor& B, tf::Tensor* C_out) {
+        std::vector<tf::Tensor> outputs;
+        std::lock_guard<std::mutex> lk(mu_);
+        auto t0 = Clock::now();
+        TF_CHECK_OK(session_->Run({{A_ph_, A}, {B_ph_, B}}, {C_op_}, &outputs));
+        double ms = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+        *C_out = std::move(outputs[0]);
+        return ms;
     }
-    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-}
+
+private:
+    tf::Scope  scope_;
+    tf::Output A_ph_, B_ph_, C_op_;
+    std::unique_ptr<tf::ClientSession> session_;
+    std::mutex mu_;
+};
+
+// ── BatchGEMMRunner (batch>1, BatchMatMul [b,M,K] x [b,K,N]) ─────────────────
+
+class BatchGEMMRunner {
+public:
+    BatchGEMMRunner() : scope_(tf::Scope::NewRootScope()) {
+        auto ph_a = tfops::Placeholder(scope_.WithOpName("A"), tf::DT_FLOAT);
+        auto ph_b = tfops::Placeholder(scope_.WithOpName("B"), tf::DT_FLOAT);
+        auto mm   = tfops::BatchMatMul(scope_.WithOpName("C"), ph_a, ph_b);
+        TF_CHECK_OK(scope_.status());
+        A_ph_ = ph_a;
+        B_ph_ = ph_b;
+        C_op_ = mm;
+        session_ = std::make_unique<tf::ClientSession>(scope_);
+    }
+
+    double Run(const tf::Tensor& A, const tf::Tensor& B, tf::Tensor* C_out) {
+        std::vector<tf::Tensor> outputs;
+        std::lock_guard<std::mutex> lk(mu_);
+        auto t0 = Clock::now();
+        TF_CHECK_OK(session_->Run({{A_ph_, A}, {B_ph_, B}}, {C_op_}, &outputs));
+        double ms = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+        *C_out = std::move(outputs[0]);
+        return ms;
+    }
+
+private:
+    tf::Scope  scope_;
+    tf::Output A_ph_, B_ph_, C_op_;
+    std::unique_ptr<tf::ClientSession> session_;
+    std::mutex mu_;
+};
 
 // ── gRPC service ──────────────────────────────────────────────────────────────
 
@@ -127,10 +166,17 @@ public:
             return {grpc::StatusCode::INVALID_ARGUMENT,
                     "a_data / b_data size mismatch with M, K, N"};
 
-        std::vector<float> C(M * N);
-        double ms = direct_sgemm(req->a_data().data(), req->b_data().data(),
-                                  C.data(), M, K, N);
-        resp->mutable_c_data()->Assign(C.begin(), C.end());
+        tf::Tensor A(tf::DT_FLOAT, tf::TensorShape({M, K}));
+        tf::Tensor B(tf::DT_FLOAT, tf::TensorShape({K, N}));
+        std::copy(req->a_data().begin(), req->a_data().end(),
+                  A.flat<float>().data());
+        std::copy(req->b_data().begin(), req->b_data().end(),
+                  B.flat<float>().data());
+
+        tf::Tensor C;
+        double ms = runner_.Run(A, B, &C);
+        auto flat = C.flat<float>();
+        resp->mutable_c_data()->Assign(flat.data(), flat.data() + M * N);
         resp->set_server_compute_ms(ms);
         return grpc::Status::OK;
     }
@@ -143,25 +189,25 @@ public:
         int warmup = req->warmup() > 0 ? req->warmup() : 10;
 
         for (int sz : req->sizes()) {
-            std::vector<float> A(sz*sz), B(sz*sz), C(sz*sz);
-            fill_random(A.data(), sz*sz);
-            fill_random(B.data(), sz*sz);
+            tf::Tensor A = make_random(sz, sz);
+            tf::Tensor B = make_random(sz, sz);
 
-            for (int i = 0; i < warmup; ++i)
-                direct_sgemm(A.data(), B.data(), C.data(), sz, sz, sz);
-
+            for (int i = 0; i < warmup; ++i) {
+                tf::Tensor C;  runner_.Run(A, B, &C);
+            }
             std::vector<double> lats(iters);
-            for (int i = 0; i < iters; ++i)
-                lats[i] = direct_sgemm(A.data(), B.data(), C.data(), sz, sz, sz);
+            for (int i = 0; i < iters; ++i) {
+                tf::Tensor C;  lats[i] = runner_.Run(A, B, &C);
+            }
 
-            auto   st  = compute_stats(lats);
+            auto st  = compute_stats(lats);
             double gfl = 2.0 * sz * sz * sz / (st.avg / 1e3) / 1e9;
             std::cout << "[sweep] " << sz << "x" << sz
                       << "  avg=" << st.avg << " ms  GFLOPS=" << gfl << "\n"
                       << std::flush;
 
             auto* r = resp->add_results();
-            r->set_m(sz); r->set_k(sz); r->set_n(sz);
+            r->set_m(sz);  r->set_k(sz);  r->set_n(sz);
             r->set_avg_ms(st.avg); r->set_p50_ms(st.p50); r->set_p99_ms(st.p99);
             r->set_gflops(gfl);
         }
@@ -169,6 +215,8 @@ public:
     }
 
     // ── ShapeSweep (production shapes) ───────────────────────────────────────
+    // batch=1  → plain  MatMul  A[M,K] x B[K,N]
+    // batch>1  → BatchMatMul   A[b,M,K] x B[b,K,N]
     grpc::Status ShapeSweep(grpc::ServerContext*,
                               const gemm::ShapeSweepRequest* req,
                               gemm::ShapeSweepResponse* resp) override {
@@ -179,23 +227,24 @@ public:
             int  b = shape.batch(), M = shape.m(), K = shape.k(), N = shape.n();
             bool batched = (b > 1);
 
-            std::vector<float> A(b*M*K), B(b*K*N), C(b*M*N);
-            fill_random(A.data(), b*M*K);
-            fill_random(B.data(), b*K*N);
+            tf::Tensor A = batched ? make_random_3d(b, M, K) : make_random(M, K);
+            tf::Tensor B = batched ? make_random_3d(b, K, N) : make_random(K, N);
 
             for (int i = 0; i < warmup; ++i) {
-                if (batched) direct_batch_sgemm(A.data(), B.data(), C.data(), b, M, K, N);
-                else         direct_sgemm(A.data(), B.data(), C.data(), M, K, N);
+                tf::Tensor C;
+                batched ? batch_runner_.Run(A, B, &C) : runner_.Run(A, B, &C);
             }
             std::vector<double> lats(iters);
             for (int i = 0; i < iters; ++i) {
-                lats[i] = batched
-                    ? direct_batch_sgemm(A.data(), B.data(), C.data(), b, M, K, N)
-                    : direct_sgemm(A.data(), B.data(), C.data(), M, K, N);
+                tf::Tensor C;
+                lats[i] = batched ? batch_runner_.Run(A, B, &C)
+                                  : runner_.Run(A, B, &C);
             }
 
-            auto   st  = compute_stats(lats);
-            double gfl = 2.0 * b * M * K * N / (st.avg / 1e3) / 1e9;
+            auto st   = compute_stats(lats);
+            double fl = 2.0 * b * M * K * N;
+            double gfl = fl / (st.avg / 1e3) / 1e9;
+
             std::cout << "[shape] " << shape.model()
                       << " b=" << b << " [" << M << "x" << K << "x" << N << "]"
                       << "  avg=" << st.avg << " ms  GFLOPS=" << gfl << "\n"
@@ -210,6 +259,10 @@ public:
         }
         return grpc::Status::OK;
     }
+
+private:
+    GEMMRunner      runner_;        // for batch=1
+    BatchGEMMRunner batch_runner_;  // for batch>1
 };
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -233,10 +286,13 @@ int main(int argc, char** argv) {
 #ifndef TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
         std::cerr << "ERROR: --backend=kblas requires building with --config=kml_kblas\n";
         return 1;
+#else
+        tf_serving_kblas_enabled = 1;
 #endif
-        g_backend = Backend::kKBLAS;
     } else if (backend == "eigen") {
-        g_backend = Backend::kEigen;
+#ifdef TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
+        tf_serving_kblas_enabled = 0;
+#endif
     } else {
         std::cerr << "Unknown backend '" << backend << "'. Use kblas|eigen\n";
         return 1;

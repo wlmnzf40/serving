@@ -1,15 +1,24 @@
 ---
-description: 鲲鹏 aarch64 上用华为 KML 的 cblas_sgemm 对比 Eigen 矩阵乘性能，运行时 --backend 切换
+description: 鲲鹏 aarch64 上用华为 KML 的 cblas_sgemm 对比 Eigen 矩阵乘性能，运行时 --backend 切换（同一条 TF Session 调用路径）
 ---
 
 # KML KBLAS Build
 
-`gemm_server` 是单个 binary，运行时用 `--backend=kblas|eigen` 切换 GEMM 实现，两条路径都直接
-调用 `cblas_sgemm` / `Eigen::Map`，绕开 TF Session，**不需要 patch TF 内部头文件**。
+`gemm_server` 是单个 binary，运行时用 `--backend=kblas|eigen` 切换，但两者走的是**完全
+相同**的 TF 调用路径：
+
+```
+ClientSession::Run(MatMul/BatchMatMul) → OpKernel → Eigen::Tensor::contract()
+```
+
+`--backend` 只设置一个全局开关 `tf_serving_kblas_enabled`，在 `contract()` 内部最底层
+的 GEMM micro-kernel 调用上二选一（`cblas_sgemm` 还是 Eigen 原生实现）。这个开关是
+**patch 进 `eigen_contraction_kernel.h` 里的**，所以 patch 这一步是**必需**的——
+不是可选优化，没有它 `--backend` 这个运行时选择在 TF 内部根本不存在。
 
 在鲲鹏（aarch64/Kunpeng）机器上完成以下流程：
 1. 获取 KML（vendor 到仓库内，无需 root）
-2. 运行 `tools/setup_kblas.sh`（自动探测路径，修复 repo.bzl，写 .bazelrc 路径）
+2. 运行 `tools/setup_kblas.sh`（探测路径、修复 repo.bzl、写 .bazelrc、**patch 头文件**）
 3. 编译一个 binary，验证 KBLAS 符号
 4. 用 `--backend=kblas` / `--backend=eigen` 起两个实例，对比 GFLOPS
 
@@ -41,7 +50,7 @@ echo $KML_LIB   # 记住这个路径
 
 ---
 
-## Step 2 — 一键 Setup
+## Step 2 — 一键 Setup（含必需的头文件 patch）
 
 ```bash
 BAZEL=/home/wanglimin/bazel-7.4.1
@@ -56,10 +65,16 @@ bash tools/setup_kblas.sh $BAZEL $KML_LIB
 setup 脚本自动完成（每步幂等）：
 - **repo.bzl 修复**：追加 `tf_serving_vendored`（缺失会报 `file does not contain symbol` 错误）
 - **.bazelrc 路径**：用实际 KML lib 绝对路径写入 `-L` 和 `-rpath`
+- **patch `eigen_contraction_kernel.h`**（**必需**）：把 `dnnl_sgemm` 调用点换成
+  `if (tf_serving_kblas_enabled) cblas_sgemm(...) else tf_serving_eigen_sgemm(...)`，
+  这就是 `--backend` 运行时切换实际生效的地方。
 
-这两步是编译 `gemm_server --config=kml_kblas` 所需的全部准备工作。脚本还会尝试 patch
-`eigen_contraction_kernel.h`，但那一步对这个 benchmark **是可选的**（仅用于让 TF 内部 MatMul
-全局走 KBLAS，见文末「进阶」），跳过不影响 `gemm_server --backend=kblas` 正常工作。
+如果提示 "patch deferred"（Bazel cache 里还没有这个头文件）：
+```bash
+$BAZEL build -c opt --distdir=/home/wanglimin/tf_new/dist \
+  //tf_serving_gemm/tf_gemm_server:gemm_server 2>&1 | tail -5
+bash tools/apply_kblas_patch.sh $BAZEL
+```
 
 ---
 
@@ -100,8 +115,11 @@ nm -D bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep cblas_sgemm
 ldd bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep kblas
 ```
 
-不带 `--config=kml_kblas` 编译的话，二进制只有 Eigen 路径，`--backend=kblas` 会在启动时
-直接报错退出（不会静默 fallback 到 Eigen）。
+不带 `--config=kml_kblas` 编译的话，二进制里 MatMul 走 TF 自己原本（未 patch）的 Eigen
+内核，`--backend=kblas` 会在启动时直接报错退出（不会静默 fallback 到 Eigen）。
+
+带了 `--config=kml_kblas` 但 Step 2 的 patch 没真正生效（比如 Bazel cache 被重新解压
+过），`cblas_sgemm` 符号也可能不存在——**先看 nm/ldd 再开始对比**。
 
 ---
 
@@ -155,6 +173,10 @@ nm -D bazel-bin/... | grep cblas_sgemm  # 确认 KBLAS 被链入
 ldd bazel-bin/... | grep kblas          # 确认 so 能找到
 ```
 
+**如果两个 backend 的 GFLOPS 几乎一样**：头文件 patch 大概率没真正生效（开关没编译进
+内核）。重跑 `bash tools/apply_kblas_patch.sh $BAZEL`，确认没有 `WARNING: dnnl_sgemm
+found but regex didn't match`，再重新编译。
+
 ---
 
 ## 常见问题速查
@@ -165,52 +187,42 @@ ldd bazel-bin/... | grep kblas          # 确认 so 能找到
 | `--backend=kblas requires building with --config=kml_kblas` | 这个 binary 没带 KML 编译 | 重新 `bash tools/build_backends.sh`，或改用 `--backend=eigen` |
 | `libkblas.so: cannot open` | LD_LIBRARY_PATH 未设 | `export LD_LIBRARY_PATH=$KML_LIB:$LD_LIBRARY_PATH` |
 | client 输出无数据行 | server crash 或超时 | 看 server.log；检查 nm/ldd |
+| 两个 backend GFLOPS 几乎相同 | 头文件 patch 没生效 | 重跑 `apply_kblas_patch.sh`，检查 WARNING，重新编译 |
 | `CONTENT_DOES_NOT_MATCH_TARGET` in fetch | 改了 WORKSPACE 触发 re-fetch | 不要改 WORKSPACE，只跑 setup_kblas.sh |
 
 ---
 
-## 调用链（当前实现，无需 patch TF）
+## 调用链
 
 ```
-gemm_server --backend=kblas
-  → direct_sgemm()  [server.cc]
-    → cblas_sgemm(CblasRowMajor, ...)
-      → libkblas.so  [鲲鹏 SVE/NEON 汇编]
-
-gemm_server --backend=eigen
-  → direct_sgemm()  [server.cc]
-    → Eigen::Map<MatRM>.noalias() = eA * eB
-      → Eigen 原生 GEBP 内核
+gemm_server --backend=kblas|eigen
+  → main() 设置 tf_serving_kblas_enabled = 1|0    [server.cc]
+  → ClientSession::Run(MatMul/BatchMatMul)          [server.cc]
+    → OpKernel::Compute()                            [TF all_kernels]
+      → Eigen::Tensor::contract()
+        → ParallelMatMulKernel  [eigen_contraction_kernel.h, patch 后]
+          if (tf_serving_kblas_enabled)
+            → cblas_sgemm(CblasColMajor, ...) → libkblas.so  [鲲鹏 SVE/NEON 汇编]
+          else
+            → tf_serving_eigen_sgemm(...)    → Eigen::Map（同一头文件内联）
 ```
 
-两条路径都不经过 TF Session/Graph 执行，测的是纯 GEMM 时间，可直接比较 GFLOPS。
+`ClientSession::Run()` 到 `Eigen::Tensor::contract()` 这条路径两个 backend 完全一致，
+只有最后一步 GEMM micro-kernel 调用不同——这正是 `--backend=eigen` 能代表"原始 TF
+执行路径"的原因，而不是另起一条绕开 TF Session 的 `Eigen::Map` 计算。
 
 ---
 
-## 进阶（可选）：让 TF 内部 MatMul 全局走 KBLAS
+## Patch 做了什么（`tools/apply_kblas_patch.sh`）
 
-上面的对比不需要这一步。如果想让 TF **任意**模型（不只是这个 benchmark）的
-`MatMul`/`BatchMatMul` 都走 KBLAS，需要 patch Bazel cache 里的 Eigen 矩阵乘内核：
+就地修改 Bazel cache 里的 `eigen_contraction_kernel.h`：
+- 宏重命名避免和 TF 原生 oneDNN 路径冲突
+- 把 `#include "dnnl.h"` 换成 `cblas_sgemm` 内联前向声明 + `tf_serving_kblas_enabled`
+  开关声明 + `tf_serving_eigen_sgemm`（与 `cblas_sgemm` 同签名的 Eigen fallback）
+- 把 `dnnl_sgemm(...)` 调用点换成运行时 `if/else`（正则匹配，容忍 TF 版本间的小差异）
+- `dnnl_gemm_u8s8s32` → memset（KML 无 int8 GEMM，这条路径不影响 fp32 benchmark）
 
-```bash
-bash tools/apply_kblas_patch.sh $BAZEL
-```
+不改 WORKSPACE，不触发 TF re-fetch，幂等可重复跑。
 
-不改 WORKSPACE、不触发 TF re-fetch，正则匹配 + 内联前向声明（避免 `-I` 触发
-hermetic 工具链的 "path outside of the execution root"），幂等可重复跑。
-
-**如果提示 "patch deferred"**：
-```bash
-$BAZEL build -c opt --distdir=/home/wanglimin/tf_new/dist \
-  //tf_serving_gemm/tf_gemm_server:gemm_server 2>&1 | tail -5
-bash tools/apply_kblas_patch.sh $BAZEL
-```
-
-Patch 后的调用链：
-```
-TF Session::Run(MatMul)
-  → eigen::TensorContraction<float>
-    → ParallelMatMulKernel  [eigen_contraction_kernel.h]  ← patch 后
-      → cblas_sgemm(CblasColMajor, ...)
-        → libkblas.so
-```
+**dnnl_sgemm pattern mismatch**（patch 脚本警告）：脚本会打印实际找到的代码片段（repr 格式），
+TF 版本略有不同时正则可能失配，把实际内容反馈给维护者即可更新 `apply_kblas_patch.sh` 里的正则。

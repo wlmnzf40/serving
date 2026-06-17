@@ -66,9 +66,13 @@ if 'TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL' in src:
     changed = True
     print("  macro renamed")
 
-# ── 2. #include "dnnl.h" → 内联前向声明（无需外部头文件，不需要 -I 标志）────
+# ── 2. #include "dnnl.h" → 内联前向声明 + 运行时开关 ─────────────────────────
 # 用标准 CBLAS 前向声明替代 #include "kblas.h"，链接期 -lkblas 提供实现。
 # 这样 Bazel hermetic 工具链不会报 "path outside of execution root"。
+#
+# tf_serving_kblas_enabled 是运行时开关（gemm_server --backend=kblas|eigen 写入），
+# 让 TF 的 MatMul/BatchMatMul 走同一条 Session::Run → Eigen::Tensor::contract() →
+# 本内核 的路径，只在最底层 GEMM 调用上二选一，而不是绕开 TF 单独调一个 Eigen::Map。
 KBLAS_DECL = '''\
 // KML KBLAS forward declarations (replaces dnnl.h; no -I flag needed).
 // Symbols resolved at link time by -lkblas.
@@ -81,7 +85,41 @@ void cblas_sgemm(CBLAS_ORDER Order,
                  float alpha, const float* A, int lda,
                               const float* B, int ldb,
                  float beta,        float* C, int ldc);
-}  // extern "C"'''
+// Runtime switch, defined in gemm_server's main.cc (server.cc); flipped by
+// --backend=kblas|eigen. Lets one binary A/B test without recompiling.
+extern int tf_serving_kblas_enabled;
+}  // extern "C"
+
+// Eigen-native fallback with the cblas_sgemm signature, used when
+// tf_serving_kblas_enabled == 0. This keeps --backend=eigen on the exact
+// same TF Session -> MatMulOp -> Eigen::Tensor::contract() call path as
+// --backend=kblas; only the innermost GEMM micro-kernel differs.
+inline void tf_serving_eigen_sgemm(CBLAS_ORDER /*order*/,
+                                    CBLAS_TRANSPOSE TransA, CBLAS_TRANSPOSE TransB,
+                                    int M, int N, int K,
+                                    float alpha, const float* A, int lda,
+                                                 const float* B, int ldb,
+                                    float beta, float* C, int ldc) {
+  typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor> _TfsMat;
+  Eigen::Map<const _TfsMat, 0, Eigen::OuterStride<>> mA(
+      A, TransA == CblasNoTrans ? M : K, TransA == CblasNoTrans ? K : M,
+      Eigen::OuterStride<>(lda));
+  Eigen::Map<const _TfsMat, 0, Eigen::OuterStride<>> mB(
+      B, TransB == CblasNoTrans ? K : N, TransB == CblasNoTrans ? N : K,
+      Eigen::OuterStride<>(ldb));
+  Eigen::Map<_TfsMat, 0, Eigen::OuterStride<>> mC(C, M, N, Eigen::OuterStride<>(ldc));
+
+  if (beta == 0.0f) { mC.setZero(); } else { mC *= beta; }
+  if (TransA == CblasNoTrans && TransB == CblasNoTrans) {
+    mC.noalias() += alpha * (mA * mB);
+  } else if (TransA != CblasNoTrans && TransB == CblasNoTrans) {
+    mC.noalias() += alpha * (mA.transpose() * mB);
+  } else if (TransA == CblasNoTrans && TransB != CblasNoTrans) {
+    mC.noalias() += alpha * (mA * mB.transpose());
+  } else {
+    mC.noalias() += alpha * (mA.transpose() * mB.transpose());
+  }
+}'''
 
 old_include = '#include "dnnl.h"'
 if old_include in src:
@@ -129,15 +167,23 @@ def _build_cblas(m):
     beta       = m.group(11).strip()
     output_ptr = m.group(12).strip()
     ldC        = m.group(13).strip()
-    # cblas(CblasColMajor) 自然顺序，无需 A/B 和 m/n 对调
+    # cblas(CblasColMajor) 自然顺序，无需 A/B 和 m/n 对调；运行时二选一
+    # （tf_serving_kblas_enabled 由 --backend=kblas|eigen 设置），TF Session ->
+    # MatMulOp -> Eigen::Tensor::contract() 的调用路径本身完全不变。
     return (
-        f"cblas_sgemm(CblasColMajor,\n"
-        f"                {transposeA} == 'N' ? CblasNoTrans : CblasTrans,\n"
-        f"                {transposeB} == 'N' ? CblasNoTrans : CblasTrans,\n"
-        f"                {mm}, {n}, {k},\n"
-        f"                {alpha}, {blockA}, {ldA},\n"
-        f"                {blockB}, {ldB},\n"
-        f"                {beta}, {output_ptr}, {ldC});"
+        f"{{\n"
+        f"      const CBLAS_TRANSPOSE _tfs_ta = ({transposeA} == 'N') ? CblasNoTrans : CblasTrans;\n"
+        f"      const CBLAS_TRANSPOSE _tfs_tb = ({transposeB} == 'N') ? CblasNoTrans : CblasTrans;\n"
+        f"      if (tf_serving_kblas_enabled) {{\n"
+        f"        cblas_sgemm(CblasColMajor, _tfs_ta, _tfs_tb, {mm}, {n}, {k},\n"
+        f"                    {alpha}, {blockA}, {ldA}, {blockB}, {ldB},\n"
+        f"                    {beta}, {output_ptr}, {ldC});\n"
+        f"      }} else {{\n"
+        f"        tf_serving_eigen_sgemm(CblasColMajor, _tfs_ta, _tfs_tb, {mm}, {n}, {k},\n"
+        f"                    {alpha}, {blockA}, {ldA}, {blockB}, {ldB},\n"
+        f"                    {beta}, {output_ptr}, {ldC});\n"
+        f"      }}\n"
+        f"    }}"
     )
 
 new_src, cnt = PAT_SGEMM.subn(_build_cblas, src)
