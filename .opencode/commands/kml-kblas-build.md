@@ -188,6 +188,7 @@ found but regex didn't match`，再重新编译。
 | `libkblas.so: cannot open` | LD_LIBRARY_PATH 未设 | `export LD_LIBRARY_PATH=$KML_LIB:$LD_LIBRARY_PATH` |
 | client 输出无数据行 | server crash 或超时 | 看 server.log；检查 nm/ldd |
 | 两个 backend GFLOPS 几乎相同 | 头文件 patch 没生效 | 重跑 `apply_kblas_patch.sh`，检查 WARNING，重新编译 |
+| 小矩阵上 KBLAS 远慢于 Eigen | 大概率是 KML 的 OMP 线程组在调用间隔被 park，下次 `cblas_sgemm` 要重新唤醒（fork/join + futex wake），延迟在小矩阵上盖过计算时间 | 看 `min_ms` 列是否接近 `avg_ms`（稳定开销 vs 离群点）；`compare_backends.sh` 已给 KBLAS 实例设 `OMP_WAIT_POLICY=active` + `GOMP_SPINCOUNT`，重跑 `shape_sweep` 模式确认 |
 | `CONTENT_DOES_NOT_MATCH_TARGET` in fetch | 改了 WORKSPACE 触发 re-fetch | 不要改 WORKSPACE，只跑 setup_kblas.sh |
 
 ---

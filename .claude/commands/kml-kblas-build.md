@@ -205,6 +205,7 @@ MxKxN         cnt  avg_ms  p50_ms  p99_ms  GFLOPS
 | `libkblas.so: cannot open shared object file` | LD_LIBRARY_PATH 未设 | `export LD_LIBRARY_PATH=$KML_LIB:$LD_LIBRARY_PATH` |
 | client 输出无数据行 | server crash 或超时 | 看 server.log；检查 nm/ldd |
 | 两个 backend GFLOPS 几乎相同 | 头文件 patch 没生效（开关没编译进内核） | 重跑 `apply_kblas_patch.sh`，检查 WARNING，重新编译 |
+| 小矩阵上 KBLAS 远慢于 Eigen（大矩阵上 KBLAS 更快，小矩阵反而慢很多） | 两个 backend 走同一条 TF 调用路径，差距只能来自 `cblas_sgemm` 本身；大概率是 KML 的 OMP 变体在调用间隔之间把线程组 park 掉，下次 parallel region 要重新唤醒（fork/join + futex wake），这个延迟在小矩阵上盖过了计算时间 | 看 `gemm_client` 输出新加的 `min_ms` 列：接近 `avg_ms` 说明是稳定的每次调用开销（而非个别离群点）。`compare_backends.sh` 已给 KBLAS 实例设置 `OMP_WAIT_POLICY=active` + `GOMP_SPINCOUNT`，重跑 `bash tools/compare_backends.sh shape_sweep` 看是否改善 |
 | `CONTENT_DOES_NOT_MATCH_TARGET` in fetch | 改了 WORKSPACE 触发 re-fetch | 不要改 WORKSPACE，只跑 setup_kblas.sh |
 
 ---

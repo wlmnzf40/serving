@@ -58,13 +58,13 @@ extern "C" int tf_serving_kblas_enabled = 1;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-struct Stats { double avg, p50, p99; };
+struct Stats { double avg, p50, p99, vmin; };
 
 static Stats compute_stats(std::vector<double> v) {
     std::sort(v.begin(), v.end());
     double s = 0;
     for (double x : v) s += x;
-    return {s / v.size(), v[v.size() / 2], v[v.size() * 99 / 100]};
+    return {s / v.size(), v[v.size() / 2], v[v.size() * 99 / 100], v.front()};
 }
 
 // 2-D random tensor [rows, cols]
@@ -203,13 +203,15 @@ public:
             auto st  = compute_stats(lats);
             double gfl = 2.0 * sz * sz * sz / (st.avg / 1e3) / 1e9;
             std::cout << "[sweep] " << sz << "x" << sz
-                      << "  avg=" << st.avg << " ms  GFLOPS=" << gfl << "\n"
+                      << "  avg=" << st.avg << " min=" << st.vmin
+                      << " ms  GFLOPS=" << gfl << "\n"
                       << std::flush;
 
             auto* r = resp->add_results();
             r->set_m(sz);  r->set_k(sz);  r->set_n(sz);
             r->set_avg_ms(st.avg); r->set_p50_ms(st.p50); r->set_p99_ms(st.p99);
             r->set_gflops(gfl);
+            r->set_min_ms(st.vmin);
         }
         return grpc::Status::OK;
     }
@@ -247,7 +249,8 @@ public:
 
             std::cout << "[shape] " << shape.model()
                       << " b=" << b << " [" << M << "x" << K << "x" << N << "]"
-                      << "  avg=" << st.avg << " ms  GFLOPS=" << gfl << "\n"
+                      << "  avg=" << st.avg << " min=" << st.vmin
+                      << " ms  GFLOPS=" << gfl << "\n"
                       << std::flush;
 
             auto* r = resp->add_results();
@@ -256,6 +259,7 @@ public:
             r->set_p50_ms(st.p50);
             r->set_p99_ms(st.p99);
             r->set_gflops(gfl);
+            r->set_min_ms(st.vmin);
         }
         return grpc::Status::OK;
     }

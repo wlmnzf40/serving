@@ -48,6 +48,9 @@ message SweepResult {
   double p50_ms  = 5;
   double p99_ms  = 6;
   double gflops  = 7;
+  // min over all measured iters; close to avg_ms => steady per-call cost,
+  // far below avg_ms => a few outliers are skewing the mean.
+  double min_ms  = 8;
 }
 
 message SweepResponse {
@@ -77,6 +80,9 @@ message ShapeResult {
   double p50_ms   = 3;
   double p99_ms   = 4;
   double gflops   = 5;
+  // min over all measured iters; close to avg_ms => steady per-call cost,
+  // far below avg_ms => a few outliers are skewing the mean.
+  double min_ms   = 6;
 }
 
 message ShapeSweepResponse {
