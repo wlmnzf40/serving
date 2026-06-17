@@ -154,7 +154,7 @@ static void run_shape_sweep(Stub& stub, int iters, int warmup) {
     }
 
     // Print grouped by (model, batch)
-    const int W1=14, W2=5, W3=10, W4=9, W5=9, W6=9, W7=10;
+    const int W1=14, W2=5, W3=10, W4=10, W5=9, W6=9, W7=9;
     std::string cur_group;
     for (const auto& r : resp.results()) {
         const auto& s  = r.shape();
@@ -167,10 +167,11 @@ static void run_shape_sweep(Stub& stub, int iters, int warmup) {
                       << std::setw(W1) << "MxKxN"
                       << std::setw(W2) << "cnt"
                       << std::setw(W3) << "avg_ms"
-                      << std::setw(W4) << "p50_ms"
-                      << std::setw(W5) << "p99_ms"
-                      << std::setw(W6) << "GFLOPS"
-                      << "\n" << std::string(W1+W2+W3+W4+W5+W6, '-') << "\n";
+                      << std::setw(W4) << "min_ms"
+                      << std::setw(W5) << "p50_ms"
+                      << std::setw(W6) << "p99_ms"
+                      << std::setw(W7) << "GFLOPS"
+                      << "\n" << std::string(W1+W2+W3+W4+W5+W6+W7, '-') << "\n";
         }
         std::string shape_str =
             std::to_string(s.m()) + "x" + std::to_string(s.k()) + "x" + std::to_string(s.n());
@@ -178,10 +179,11 @@ static void run_shape_sweep(Stub& stub, int iters, int warmup) {
                   << std::setw(W2) << s.count()
                   << std::fixed << std::setprecision(4)
                   << std::setw(W3) << r.avg_ms()
-                  << std::setw(W4) << r.p50_ms()
-                  << std::setw(W5) << r.p99_ms()
+                  << std::setw(W4) << r.min_ms()
+                  << std::setw(W5) << r.p50_ms()
+                  << std::setw(W6) << r.p99_ms()
                   << std::setprecision(3)
-                  << std::setw(W6) << r.gflops()
+                  << std::setw(W7) << r.gflops()
                   << "\n";
     }
     std::cout << "\n";
@@ -209,15 +211,17 @@ static void run_sweep(Stub& stub, const std::vector<int>& sizes,
               << std::left
               << std::setw(W) << "Size"
               << std::setw(W) << "avg_ms"
+              << std::setw(W) << "min_ms"
               << std::setw(W) << "p50_ms"
               << std::setw(W) << "p99_ms"
               << std::setw(W) << "GFLOPS"
-              << "\n" << std::string(W * 5, '-') << "\n";
+              << "\n" << std::string(W * 6, '-') << "\n";
     for (const auto& r : resp.results()) {
         std::string sz = std::to_string(r.m()) + "x" + std::to_string(r.n());
         std::cout << std::left  << std::setw(W) << sz
                   << std::fixed << std::setprecision(3)
                   << std::setw(W) << r.avg_ms()
+                  << std::setw(W) << r.min_ms()
                   << std::setw(W) << r.p50_ms()
                   << std::setw(W) << r.p99_ms()
                   << std::setw(W) << r.gflops() << "\n";

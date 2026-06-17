@@ -44,6 +44,13 @@ cc_grpc_library(
 #   all_kernels    : links the MatMul compute kernel
 #                    without this you get "No OpKernel registered for MatMul" at Run()
 #   core_cpu       : TF executor / threadpool runtime
+#
+# Built without --config=kml_kblas: plain TF, MatMul always runs Eigen's native
+#   contraction kernel (--backend=eigen, default; --backend=kblas errors at startup)
+# Built with    --config=kml_kblas: requires tools/apply_kblas_patch.sh to have
+#   already patched eigen_contraction_kernel.h in the Bazel cache — that patch is
+#   what makes --backend=kblas|eigen exist as a runtime switch inside MatMul's
+#   Eigen::Tensor::contract() call (see server.cc's tf_serving_kblas_enabled).
 
 cc_binary(
     name = "gemm_server",

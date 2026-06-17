@@ -7,6 +7,19 @@
  *   ShapeSweep — server-side benchmark for arbitrary production shapes
  *                (batch=1 → plain MatMul, batch>1 → BatchMatMul)
  *
+ * Flags:
+ *   --addr=host:port   listen address            (default 0.0.0.0:50052)
+ *   --backend=kblas    innermost GEMM uses cblas_sgemm (libkblas.so)
+ *   --backend=eigen    innermost GEMM uses Eigen's native kernel
+ *
+ * Both values run the identical Session::Run -> MatMulOp/BatchMatMulOp ->
+ * Eigen::Tensor::contract() call path — the flag only flips
+ * tf_serving_kblas_enabled, a runtime switch read inside the patched
+ * eigen_contraction_kernel.h (see tools/apply_kblas_patch.sh). That patch is a
+ * required prerequisite: it's what makes the switch and --config=kml_kblas
+ * build exist in the first place. Without it, --backend=kblas fails fast
+ * below instead of silently running Eigen.
+ *
  * Build (same flags as tensorflow_model_server, different target):
  *   //tf_serving_gemm/tf_gemm_server:gemm_server
  */
@@ -33,15 +46,25 @@ namespace tf    = tensorflow;
 namespace tfops = tensorflow::ops;
 using Clock = std::chrono::steady_clock;
 
+// Runtime switch read by the patched eigen_contraction_kernel.h. Defined here
+// (not in the header) so --backend flips one process-wide flag instead of
+// requiring a rebuild; every Session::Run() afterwards picks it up at the
+// innermost GEMM call inside Eigen::Tensor::contract(). Only declared when
+// the binary is built --config=kml_kblas, since that's the only configuration
+// where the patched header references it.
+#ifdef TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
+extern "C" int tf_serving_kblas_enabled = 1;
+#endif
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-struct Stats { double avg, p50, p99; };
+struct Stats { double avg, p50, p99, vmin; };
 
 static Stats compute_stats(std::vector<double> v) {
     std::sort(v.begin(), v.end());
     double s = 0;
     for (double x : v) s += x;
-    return {s / v.size(), v[v.size() / 2], v[v.size() * 99 / 100]};
+    return {s / v.size(), v[v.size() / 2], v[v.size() * 99 / 100], v.front()};
 }
 
 // 2-D random tensor [rows, cols]
@@ -180,13 +203,15 @@ public:
             auto st  = compute_stats(lats);
             double gfl = 2.0 * sz * sz * sz / (st.avg / 1e3) / 1e9;
             std::cout << "[sweep] " << sz << "x" << sz
-                      << "  avg=" << st.avg << " ms  GFLOPS=" << gfl << "\n"
+                      << "  avg=" << st.avg << " min=" << st.vmin
+                      << " ms  GFLOPS=" << gfl << "\n"
                       << std::flush;
 
             auto* r = resp->add_results();
             r->set_m(sz);  r->set_k(sz);  r->set_n(sz);
             r->set_avg_ms(st.avg); r->set_p50_ms(st.p50); r->set_p99_ms(st.p99);
             r->set_gflops(gfl);
+            r->set_min_ms(st.vmin);
         }
         return grpc::Status::OK;
     }
@@ -224,7 +249,8 @@ public:
 
             std::cout << "[shape] " << shape.model()
                       << " b=" << b << " [" << M << "x" << K << "x" << N << "]"
-                      << "  avg=" << st.avg << " ms  GFLOPS=" << gfl << "\n"
+                      << "  avg=" << st.avg << " min=" << st.vmin
+                      << " ms  GFLOPS=" << gfl << "\n"
                       << std::flush;
 
             auto* r = resp->add_results();
@@ -233,6 +259,7 @@ public:
             r->set_p50_ms(st.p50);
             r->set_p99_ms(st.p99);
             r->set_gflops(gfl);
+            r->set_min_ms(st.vmin);
         }
         return grpc::Status::OK;
     }
@@ -246,11 +273,37 @@ private:
 
 int main(int argc, char** argv) {
     std::string addr = "0.0.0.0:50052";
+#ifdef TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
+    std::string backend = "kblas";
+#else
+    std::string backend = "eigen";
+#endif
+
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a.rfind("--addr=", 0) == 0) addr = a.substr(7);
+        if      (a.rfind("--addr=",    0) == 0) addr    = a.substr(7);
+        else if (a.rfind("--backend=", 0) == 0) backend = a.substr(10);
         else { std::cerr << "Unknown flag: " << a << "\n"; return 1; }
     }
+
+    if (backend == "kblas") {
+#ifndef TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
+        std::cerr << "ERROR: --backend=kblas requires building with --config=kml_kblas\n";
+        return 1;
+#else
+        tf_serving_kblas_enabled = 1;
+#endif
+    } else if (backend == "eigen") {
+#ifdef TENSORFLOW_USE_MKLDNN_CONTRACTION_KERNEL_KML
+        tf_serving_kblas_enabled = 0;
+#endif
+    } else {
+        std::cerr << "Unknown backend '" << backend << "'. Use kblas|eigen\n";
+        return 1;
+    }
+
+    std::cout << "TF GEMM server  addr=" << addr
+              << "  backend=" << backend << "\n";
 
     GEMMServiceImpl service;
     grpc::ServerBuilder builder;
@@ -260,8 +313,6 @@ int main(int argc, char** argv) {
     builder.SetMaxSendMessageSize(256 << 20);
 
     auto server = builder.BuildAndStart();
-    std::cout << "TF GEMM server on " << addr
-              << "  (MatMul / BatchMatMul kernels)\n";
     server->Wait();
     return 0;
 }
