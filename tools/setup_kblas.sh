@@ -114,15 +114,20 @@ else
     echo "[2/3] .bazelrc: kml_kblas linkopt not found (unexpected). Please check .bazelrc manually."
 fi
 
-# ── Step 3: patch eigen_contraction_kernel.h ──────────────────────────────────
+# ── Step 3 (可选): patch eigen_contraction_kernel.h ───────────────────────────
+# 仅用于让 TF 内部 MatMul/BatchMatMul 全局走 KBLAS。
+# gemm_server --backend=kblas|eigen 直接调用 cblas_sgemm/Eigen::Map，不依赖这个 patch，
+# 跳过本步骤完全不影响 build_backends.sh / compare_backends.sh 的使用。
 
 if [[ ! -x "$BAZEL" ]]; then
-    echo "[3/3] bazel not found at $BAZEL — skipping header patch"
-    echo "  请在安装好 bazel 后单独运行："
-    echo "    bash $SCRIPT_DIR/apply_kblas_patch.sh $BAZEL"
+    echo "[3/3] bazel not found at $BAZEL — skipping header patch (optional, see below)"
     echo ""
-    echo "=== Setup complete (patch skipped) ==="
-    _print_summary
+    echo "=== Setup complete (header patch skipped) ==="
+    echo ""
+    echo "repo.bzl 和 .bazelrc 已就绪，gemm_server --backend=kblas|eigen 不依赖头文件 patch，"
+    echo "可以直接编译（见 tools/build_backends.sh）。"
+    echo "头文件 patch 只在你想让 TF 内部 MatMul 全局走 KBLAS 时才需要："
+    echo "  bash $SCRIPT_DIR/apply_kblas_patch.sh $BAZEL"
     exit 0
 fi
 
@@ -133,11 +138,12 @@ if [[ -n "$OUTPUT_BASE" ]]; then
 fi
 
 if [[ -z "$OUTPUT_BASE" ]] || [[ ! -f "$HEADER" ]]; then
-    echo "[3/3] eigen_contraction_kernel.h: Bazel cache 里还没有这个文件。"
+    echo "[3/3] eigen_contraction_kernel.h: Bazel cache 里还没有这个文件（可选步骤，跳过）。"
+    echo "  只有想让 TF 内部 MatMul 全局走 KBLAS 时才需要这个 patch；如需要："
     echo "  先不加 --config=kml_kblas 跑一次普通 build 让 Bazel 解压 TF，"
-    echo "  然后重新执行本脚本。"
+    echo "  然后重新执行本脚本，或直接跑 tools/apply_kblas_patch.sh。"
     echo ""
-    echo "=== Setup complete (patch deferred) ==="
+    echo "=== Setup complete (optional header patch deferred) ==="
     exit 0
 fi
 
@@ -162,7 +168,10 @@ echo "  # 预期：U cblas_sgemm"
 echo "  ldd bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server | grep kblas"
 echo "  # 预期：libkblas.so => $KML_LIB_DIR/libkblas.so"
 echo ""
-echo "编译命令："
+echo "编译（一个 binary，同时支持 --backend=kblas|eigen）："
+echo "  bash tools/build_backends.sh $BAZEL"
+echo ""
+echo "  等价的手动命令："
 echo "  $BAZEL build -c opt \\"
 echo "    --distdir=$BAZEL_DISTDIR \\"
 echo "    --define=no_cuda_support=true --define=no_nccl_support=true \\"
@@ -176,8 +185,10 @@ echo "    --config=kml_kblas \\"
 echo "    //tf_serving_gemm/tf_gemm_server:gemm_server \\"
 echo "    //tf_serving_gemm/tf_gemm_server:gemm_client"
 echo ""
-echo "运行（必须设 LD_LIBRARY_PATH，因为 $KML_LIB_DIR 在非标准位置）："
+echo "运行对比（必须设 LD_LIBRARY_PATH，因为 $KML_LIB_DIR 在非标准位置）："
 echo "  export LD_LIBRARY_PATH=$KML_LIB_DIR:\$LD_LIBRARY_PATH"
-echo "  ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server &"
-echo "  sleep 3 && cat server.log   # 确认启动日志"
+echo "  bash tools/compare_backends.sh          # 一键起两个实例 + 跑 benchmark + 对比"
+echo ""
+echo "  或手动："
+echo "  ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_server --backend=kblas &"
 echo "  ./bazel-bin/tf_serving_gemm/tf_gemm_server/gemm_client --iters=30 --warmup=5"
